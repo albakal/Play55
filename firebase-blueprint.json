@@ -1,0 +1,53 @@
+{
+  "entities": {
+    "DeveloperProfile": {
+      "title": "DeveloperProfile",
+      "description": "Verified Google-authenticated developer account allowed to publish APK packages.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Developer display name from Google profile",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified Google email address",
+          "minLength": 3,
+          "maxLength": 200
+        },
+        "photoUrl": {
+          "type": "string",
+          "description": "Google profile avatar URL",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "displayName", "email", "createdAt", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "/developers/{userId}": {
+      "schema": {
+        "$ref": "#/entities/DeveloperProfile"
+      },
+      "description": "Private developer profile documents keyed by authenticated Firebase UID."
+    }
+  }
+}

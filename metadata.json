@@ -1,0 +1,6 @@
+{
+  "name": "متجر تطبيقات بلس",
+  "description": "متجر إلكتروني احترافي لتصفح وتثبيت تطبيقات أندرويد بصيغة APK مباشرة مع استخراج الأيقونات والصور الترويجية ونظام التقييمات والمراجعات.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
