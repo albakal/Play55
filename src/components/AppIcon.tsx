@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Smartphone } from 'lucide-react';
+import { resolveAssetUrl } from '../data/fallbackStore.ts';
 
 interface AppIconProps {
   src: string;
@@ -9,8 +10,9 @@ interface AppIconProps {
 
 export function AppIcon({ src, alt, className = 'w-16 h-16 rounded-2xl' }: AppIconProps) {
   const [failed, setFailed] = useState(false);
+  const resolvedSrc = resolveAssetUrl(src);
 
-  if (!src || failed) {
+  if (!resolvedSrc || failed) {
     return (
       <div
         aria-label={alt}
@@ -23,7 +25,7 @@ export function AppIcon({ src, alt, className = 'w-16 h-16 rounded-2xl' }: AppIc
 
   return (
     <img
-      src={src}
+      src={resolvedSrc}
       alt={alt}
       referrerPolicy="no-referrer"
       onError={() => setFailed(true)}

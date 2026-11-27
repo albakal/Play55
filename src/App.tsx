@@ -16,6 +16,11 @@ import {
   signOutDeveloper,
   syncDeveloperProfile,
 } from './firebase.ts';
+import {
+  BUNDLED_HERO_BANNER,
+  FALLBACK_APPS,
+  FALLBACK_REVIEWS,
+} from './data/fallbackStore.ts';
 import { StoreHeader } from './components/StoreHeader.tsx';
 import type { NavTab } from './components/StoreHeader.tsx';
 import { AppIcon } from './components/AppIcon.tsx';
@@ -99,12 +104,23 @@ export default function App() {
     try {
       const sort =
         activeTab === 'top-rated' ? 'rating' : activeTab === 'newest' ? 'newest' : 'popular';
-      const res = await fetch(`/api/apps?sort=${encodeURIComponent(sort)}`);
-      if (!res.ok) throw new Error('Failed to load');
+      const res = await fetch(`./api/apps?sort=${encodeURIComponent(sort)}`);
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) {
+        throw new Error('Static fallback');
+      }
       const data = (await res.json()) as { apps: StoreApp[] };
       setApps(data.apps);
     } catch {
-      setLoadError('تعذر تحميل قائمة التطبيقات، يرجى تحديث الصفحة.');
+      const sorted = [...FALLBACK_APPS];
+      if (activeTab === 'top-rated') {
+        sorted.sort((a, b) => b.averageRating - a.averageRating);
+      } else if (activeTab === 'newest') {
+        sorted.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      } else {
+        sorted.sort((a, b) => b.downloads - a.downloads);
+      }
+      setApps(sorted);
     } finally {
       setLoading(false);
     }
@@ -121,8 +137,14 @@ export default function App() {
     setLoadingDetail(true);
     window.scrollTo({ top: 0, behavior: 'smooth' });
     try {
-      const res = await fetch(`/api/apps/${encodeURIComponent(appId)}`);
-      if (!res.ok) {
+      const res = await fetch(`./api/apps/${encodeURIComponent(appId)}`);
+      const contentType = res.headers.get('content-type') || '';
+      if (!res.ok || !contentType.includes('application/json')) {
+        const localApp = FALLBACK_APPS.find((a) => a.id === appId);
+        if (localApp) {
+          setDetailData({ app: localApp, reviews: FALLBACK_REVIEWS[appId] || [] });
+          return;
+        }
         setSelectedAppId(null);
         setDetailData(null);
         return;
@@ -130,7 +152,12 @@ export default function App() {
       const data = (await res.json()) as AppDetailResponse;
       setDetailData(data);
     } catch {
-      setDetailData(null);
+      const localApp = FALLBACK_APPS.find((a) => a.id === appId);
+      if (localApp) {
+        setDetailData({ app: localApp, reviews: FALLBACK_REVIEWS[appId] || [] });
+      } else {
+        setDetailData(null);
+      }
     } finally {
       setLoadingDetail(false);
     }
@@ -410,7 +437,7 @@ export default function App() {
 
                 <div className="lg:col-span-6 relative min-h-[240px] lg:min-h-full bg-[#E8EAED]">
                   <img
-                    src="/src/assets/images/hero_banner_store_1795812501251.jpg"
+                    src={BUNDLED_HERO_BANNER}
                     alt="استعراض تطبيقات أندرويد المميزة"
                     referrerPolicy="no-referrer"
                     className="w-full h-full object-cover lg:h-full"

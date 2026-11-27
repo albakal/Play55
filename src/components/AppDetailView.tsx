@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import type { User } from 'firebase/auth';
 import type { ReviewItem, StoreApp } from '../types.ts';
+import { resolveAssetUrl } from '../data/fallbackStore.ts';
 import { AppIcon } from './AppIcon.tsx';
 import { StarRating } from './StarRating.tsx';
 
@@ -441,21 +442,24 @@ export function AppDetailView({
             الصور الترويجية للتطبيق
           </h2>
           <div className="flex gap-4 overflow-x-auto pb-2 no-scrollbar">
-            {app.screenshots.map((shot, idx) => (
-              <button
-                key={`${shot}-${idx}`}
-                type="button"
-                onClick={() => setLightboxImage(shot)}
-                className="group relative shrink-0 w-72 sm:w-96 aspect-video rounded-2xl overflow-hidden border border-[#E8EAED] bg-[#F8F9FA] focus-visible:outline-2 focus-visible:outline-[#01875F]"
-              >
-                <img
-                  src={shot}
-                  alt={`صورة ترويجية ${idx + 1} لتطبيق ${app.name}`}
-                  referrerPolicy="no-referrer"
-                  className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-200"
-                />
-              </button>
-            ))}
+            {app.screenshots.map((shot, idx) => {
+              const resolvedShot = resolveAssetUrl(shot);
+              return (
+                <button
+                  key={`${shot}-${idx}`}
+                  type="button"
+                  onClick={() => setLightboxImage(resolvedShot)}
+                  className="group relative shrink-0 w-72 sm:w-96 aspect-video rounded-2xl overflow-hidden border border-[#E8EAED] bg-[#F8F9FA] focus-visible:outline-2 focus-visible:outline-[#01875F]"
+                >
+                  <img
+                    src={resolvedShot}
+                    alt={`صورة ترويجية ${idx + 1} لتطبيق ${app.name}`}
+                    referrerPolicy="no-referrer"
+                    className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-200"
+                  />
+                </button>
+              );
+            })}
           </div>
         </section>
       )}
