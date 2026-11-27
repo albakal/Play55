@@ -14,8 +14,7 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
-import type { User } from 'firebase/auth';
-import type { ReviewItem, StoreApp } from '../types.ts';
+import type { DeveloperSessionUser, ReviewItem, StoreApp } from '../types.ts';
 import { resolveAssetUrl } from '../data/fallbackStore.ts';
 import { AppIcon } from './AppIcon.tsx';
 import { StarRating } from './StarRating.tsx';
@@ -23,7 +22,8 @@ import { StarRating } from './StarRating.tsx';
 interface AppDetailViewProps {
   app: StoreApp;
   reviews: ReviewItem[];
-  currentUser: User | null;
+  currentUser: DeveloperSessionUser | null;
+  getAuthToken: () => Promise<string | null>;
   onBack: () => void;
   onAppUpdated: (updatedApp: StoreApp, updatedReviews?: ReviewItem[]) => void;
   onAppDeleted: (appId: string) => void;
@@ -51,6 +51,7 @@ export function AppDetailView({
   app,
   reviews,
   currentUser,
+  getAuthToken,
   onBack,
   onAppUpdated,
   onAppDeleted,
@@ -219,8 +220,9 @@ export function AppDetailView({
   const handleDeleteApp = async () => {
     if (!currentUser) return;
     try {
-      const token = await currentUser.getIdToken();
-      const res = await fetch(`/api/apps/${encodeURIComponent(app.id)}`, {
+      const token = await getAuthToken();
+      if (!token) return;
+      const res = await fetch(`./api/apps/${encodeURIComponent(app.id)}`, {
         method: 'DELETE',
         headers: {
           Authorization: `Bearer ${token}`,

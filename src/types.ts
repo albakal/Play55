@@ -58,6 +58,14 @@ export interface AppDetailResponse {
   reviews: ReviewItem[];
 }
 
+export interface DeveloperSessionUser {
+  uid: string;
+  displayName: string;
+  email: string;
+  photoURL?: string | null;
+  provider: 'manual' | 'google';
+}
+
 export interface ExtractedApkInfo {
   packageName: string;
   versionName: string;

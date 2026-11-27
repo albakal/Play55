@@ -43,24 +43,130 @@ const adminApp = firebaseProjectId
   : null;
 const adminAuth = adminApp ? getAdminAuth(adminApp) : null;
 
+const USERS_FILE = path.join(DATA_DIR, 'users.json');
+const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+
+interface StoredUser {
+  uid: string;
+  displayName: string;
+  email: string;
+  salt: string;
+  passwordHash: string;
+  createdAt: string;
+}
+
+function loadUsers(): StoredUser[] {
+  if (!fs.existsSync(USERS_FILE)) {
+    fs.writeFileSync(USERS_FILE, '[]', 'utf8');
+    return [];
+  }
+  try {
+    const parsed = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
+    return Array.isArray(parsed) ? (parsed as StoredUser[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+let userWriteQueue = Promise.resolve();
+function saveUsers(usersList: StoredUser[]): Promise<void> {
+  userWriteQueue = userWriteQueue.then(async () => {
+    const tmp = `${USERS_FILE}.tmp`;
+    await fs.promises.writeFile(tmp, JSON.stringify(usersList, null, 2), 'utf8');
+    await fs.promises.rename(tmp, USERS_FILE);
+  });
+  return userWriteQueue;
+}
+
+let usersDb = loadUsers();
+
+function hashPassword(password: string): { salt: string; hash: string } {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 64).toString('hex');
+  return { salt, hash };
+}
+
+function verifyPassword(password: string, salt: string, expectedHash: string): boolean {
+  const derived = crypto.scryptSync(password, salt, 64);
+  const expected = Buffer.from(expectedHash, 'hex');
+  if (derived.length !== expected.length) return false;
+  return crypto.timingSafeEqual(derived, expected);
+}
+
+interface CustomTokenPayload {
+  uid: string;
+  email: string;
+  name: string;
+  exp: number;
+}
+
+function signSessionToken(user: StoredUser): string {
+  const payload: CustomTokenPayload = {
+    uid: user.uid,
+    email: user.email,
+    name: user.displayName,
+    exp: Date.now() + 7 * 24 * 60 * 60 * 1000,
+  };
+  const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(encoded).digest('base64url');
+  return `dev1.${encoded}.${sig}`;
+}
+
+function verifySessionToken(token: string): VerifiedDeveloper | null {
+  if (!token.startsWith('dev1.')) return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [, encoded, sig] = parts;
+  const expectedSig = crypto
+    .createHmac('sha256', SESSION_SECRET)
+    .update(encoded)
+    .digest('base64url');
+  const a = Buffer.from(sig, 'utf8');
+  const b = Buffer.from(expectedSig, 'utf8');
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const payload = JSON.parse(
+      Buffer.from(encoded, 'base64url').toString('utf8')
+    ) as CustomTokenPayload;
+    if (!payload.uid || !payload.email || typeof payload.exp !== 'number' || payload.exp < Date.now()) {
+      return null;
+    }
+    return {
+      uid: payload.uid,
+      email: payload.email,
+      name: payload.name || '',
+      provider: 'manual',
+    };
+  } catch {
+    return null;
+  }
+}
+
 interface VerifiedDeveloper {
   uid: string;
   email: string;
   name: string;
+  provider: 'manual' | 'google';
 }
 
 async function verifyDeveloperRequest(req: express.Request): Promise<VerifiedDeveloper | null> {
-  if (!adminAuth) return null;
   const authHeader = req.headers.authorization || '';
   if (!authHeader.startsWith('Bearer ')) return null;
   const token = authHeader.slice(7).trim();
   if (!token) return null;
+
+  if (token.startsWith('dev1.')) {
+    return verifySessionToken(token);
+  }
+
+  if (!adminAuth) return null;
   try {
     const decoded = await adminAuth.verifyIdToken(token);
     return {
       uid: decoded.uid,
       email: decoded.email || '',
       name: typeof decoded.name === 'string' ? decoded.name : '',
+      provider: 'google',
     };
   } catch {
     return null;
@@ -560,6 +666,105 @@ async function startServer() {
   // Static uploaded media
   app.use('/uploads', express.static(UPLOADS_DIR));
 
+  // Manual Developer Auth: Register
+  app.post('/api/auth/register', async (req, res) => {
+    const body = req.body as { name?: unknown; email?: unknown; password?: unknown };
+    const displayName = typeof body.name === 'string' ? body.name.trim() : '';
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+    const password = typeof body.password === 'string' ? body.password : '';
+
+    if (displayName.length < 2 || displayName.length > 80) {
+      res.status(400).json({ error: 'يرجى إدخال الاسم الكامل (حرفان على الأقل)' });
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 160) {
+      res.status(400).json({ error: 'يرجى إدخال بريد إلكتروني صحيح' });
+      return;
+    }
+    if (password.length < 8 || password.length > 128) {
+      res.status(400).json({ error: 'يجب أن تتكون كلمة المرور من 8 أحرف على الأقل' });
+      return;
+    }
+
+    if (usersDb.some((u) => u.email === email)) {
+      res.status(409).json({ error: 'هذا البريد الإلكتروني مسجل مسبقاً، يرجى تسجيل الدخول' });
+      return;
+    }
+
+    const { salt, hash } = hashPassword(password);
+    const newUser: StoredUser = {
+      uid: `local-${crypto.randomBytes(8).toString('hex')}`,
+      displayName,
+      email,
+      salt,
+      passwordHash: hash,
+      createdAt: new Date().toISOString(),
+    };
+
+    usersDb.push(newUser);
+    await saveUsers(usersDb);
+
+    const token = signSessionToken(newUser);
+    res.status(201).json({
+      token,
+      user: {
+        uid: newUser.uid,
+        displayName: newUser.displayName,
+        email: newUser.email,
+        photoURL: null,
+        provider: 'manual',
+      },
+    });
+  });
+
+  // Manual Developer Auth: Login
+  app.post('/api/auth/login', (req, res) => {
+    const body = req.body as { email?: unknown; password?: unknown };
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+    const password = typeof body.password === 'string' ? body.password : '';
+
+    if (!email || !password) {
+      res.status(400).json({ error: 'يرجى إدخال البريد الإلكتروني وكلمة المرور' });
+      return;
+    }
+
+    const found = usersDb.find((u) => u.email === email);
+    if (!found || !verifyPassword(password, found.salt, found.passwordHash)) {
+      res.status(401).json({ error: 'البريد الإلكتروني أو كلمة المرور غير صحيحة' });
+      return;
+    }
+
+    const token = signSessionToken(found);
+    res.json({
+      token,
+      user: {
+        uid: found.uid,
+        displayName: found.displayName,
+        email: found.email,
+        photoURL: null,
+        provider: 'manual',
+      },
+    });
+  });
+
+  // Verify current session
+  app.get('/api/auth/me', async (req, res) => {
+    const verified = await verifyDeveloperRequest(req);
+    if (!verified) {
+      res.status(401).json({ error: 'الجلسة غير صالحة' });
+      return;
+    }
+    res.json({
+      user: {
+        uid: verified.uid,
+        displayName: verified.name || verified.email,
+        email: verified.email,
+        photoURL: null,
+        provider: verified.provider,
+      },
+    });
+  });
+
   // Generated SVG icons for secondary seeded apps
   app.get('/api/brand-icon/:slug', (req, res) => {
     res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
@@ -642,7 +847,7 @@ async function startServer() {
     async (req, res, next) => {
       const developerUser = await verifyDeveloperRequest(req);
       if (!developerUser) {
-        res.status(401).json({ error: 'يجب تسجيل الدخول بحساب جوجل أولاً قبل رفع التطبيق' });
+        res.status(401).json({ error: 'يجب تسجيل الدخول بحساب المطور أولاً قبل رفع التطبيق' });
         return;
       }
       res.locals.developerUser = developerUser;
@@ -663,10 +868,22 @@ async function startServer() {
           return;
         }
 
+        const ALLOWED_CATEGORIES: AppCategory[] = [
+          'الإنتاجية',
+          'الأدوات',
+          'الصوتيات',
+          'التعليم',
+          'الأعمال',
+          'التصوير',
+          'الألعاب',
+        ];
         const body = req.body as Record<string, string>;
         const name = (body.name || '').trim();
         const developer = (body.developer || '').trim() || developerUser.name || 'مطور مستقل';
-        const category = ((body.category || '').trim() || 'الإنتاجية') as AppCategory;
+        const rawCategory = (body.category || '').trim() as AppCategory;
+        const category: AppCategory = ALLOWED_CATEGORIES.includes(rawCategory)
+          ? rawCategory
+          : 'الإنتاجية';
         const shortDescription = (body.shortDescription || '').trim();
         const fullDescription = (body.fullDescription || '').trim() || shortDescription;
 
@@ -856,7 +1073,7 @@ async function startServer() {
   app.delete('/api/apps/:id', async (req, res) => {
     const developerUser = await verifyDeveloperRequest(req);
     if (!developerUser) {
-      res.status(401).json({ error: 'يجب تسجيل الدخول بحساب جوجل لحذف التطبيق' });
+      res.status(401).json({ error: 'يجب تسجيل الدخول بحساب المطور لحذف التطبيق' });
       return;
     }
 

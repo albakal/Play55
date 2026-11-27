@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
-import type { User } from 'firebase/auth';
 import {
   ArrowUpLeft,
   CheckCircle2,
@@ -9,7 +8,13 @@ import {
   Star,
   Upload,
 } from 'lucide-react';
-import type { AppCategory, AppDetailResponse, ReviewItem, StoreApp } from './types.ts';
+import type {
+  AppCategory,
+  AppDetailResponse,
+  DeveloperSessionUser,
+  ReviewItem,
+  StoreApp,
+} from './types.ts';
 import {
   auth,
   signInWithGoogle,
@@ -63,22 +68,74 @@ export default function App() {
   const [quickInstallingId, setQuickInstallingId] = useState<string | null>(null);
   const [quickInstalledId, setQuickInstalledId] = useState<string | null>(null);
 
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [currentUser, setCurrentUser] = useState<DeveloperSessionUser | null>(null);
+  const [manualToken, setManualToken] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setCurrentUser(user);
-      setAuthLoading(false);
-      if (user) {
-        void syncDeveloperProfile(user).catch(() => {
+    const unsubscribe = onAuthStateChanged(auth, (fbUser) => {
+      if (fbUser) {
+        setManualToken(null);
+        setCurrentUser({
+          uid: fbUser.uid,
+          displayName: fbUser.displayName || fbUser.email || 'مطور جوجل',
+          email: fbUser.email || '',
+          photoURL: fbUser.photoURL,
+          provider: 'google',
+        });
+        void syncDeveloperProfile(fbUser).catch(() => {
           // Handled inside syncDeveloperProfile error logging
         });
+      } else {
+        setCurrentUser((prev) => (prev?.provider === 'manual' ? prev : null));
       }
+      setAuthLoading(false);
     });
     return () => unsubscribe();
   }, []);
+
+  const handleManualAuth = async (params: {
+    mode: 'login' | 'register';
+    name?: string;
+    email: string;
+    password: string;
+  }) => {
+    setAuthError(null);
+    const endpoint =
+      params.mode === 'register' ? './api/auth/register' : './api/auth/login';
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: params.name,
+          email: params.email,
+          password: params.password,
+        }),
+      });
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        setAuthError(
+          'خادم المصادقة ورفع ملفات APK غير متصل على الاستضافة الثابتة. يرجى فتح رابط التطبيق الكامل من AI Studio.'
+        );
+        return;
+      }
+      const data = (await res.json()) as {
+        error?: string;
+        token?: string;
+        user?: DeveloperSessionUser;
+      };
+      if (!res.ok || !data.token || !data.user) {
+        setAuthError(data.error || 'تعذر إتمام العملية، يرجى التحقق من البيانات.');
+        return;
+      }
+      setManualToken(data.token);
+      setCurrentUser(data.user);
+    } catch {
+      setAuthError('تعذر الاتصال بالخادم، يرجى المحاولة مرة أخرى.');
+    }
+  };
 
   const handleGoogleSignIn = async () => {
     setAuthError(null);
@@ -91,21 +148,35 @@ export default function App() {
         setAuthError('تم إغلاق نافذة تسجيل الدخول قبل إتمام العملية.');
       } else if (code === 'auth/unauthorized-domain' || msg.includes('unauthorized-domain')) {
         setAuthError(
-          `النطاق (${window.location.hostname}) غير مضاف في النطاقات المصرح بها (Authorized domains) في Firebase Authentication. أضفه من لوحة Firebase أو استخدم رابط التطبيق المباشر في AI Studio.`
+          `النطاق (${window.location.hostname}) غير مضاف في النطاقات المصرح بها (Authorized domains) في Firebase. يمكنك التسجيل يدوياً بالأعلى عبر الاسم والبريد وكلمة المرور أو فتح رابط AI Studio المباشر.`
         );
       } else if (code === 'auth/popup-blocked' || msg.includes('popup-blocked')) {
-        setAuthError('حظر المتصفح نافذة تسجيل الدخول المنبثقة. يرجى السماح بالنوافذ المنبثقة أو الفتح في متصفح Chrome.');
+        setAuthError('حظر المتصفح نافذة تسجيل الدخول المنبثقة. يمكنك التسجيل يدوياً أو السماح بالنوافذ المنبثقة.');
       } else {
         setAuthError(
-          `تعذر تسجيل الدخول بحساب جوجل (${code || 'خطأ غير معروف'})، يرجى المحاولة مرة أخرى.`
+          `تعذر تسجيل الدخول بحساب جوجل (${code || 'خطأ غير معروف'})، يمكنك استخدام التسجيل اليدوي بالبريد وكلمة المرور.`
         );
       }
     }
   };
 
   const handleSignOut = async () => {
-    await signOutDeveloper();
+    setManualToken(null);
+    setCurrentUser(null);
+    await signOutDeveloper().catch(() => {});
   };
+
+  const getAuthToken = useCallback(async (): Promise<string | null> => {
+    if (manualToken) return manualToken;
+    if (auth.currentUser) {
+      try {
+        return await auth.currentUser.getIdToken();
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }, [manualToken]);
 
   const fetchApps = useCallback(async () => {
     setLoading(true);
@@ -274,8 +345,10 @@ export default function App() {
             user={currentUser}
             authLoading={authLoading}
             authError={authError}
-            onSignIn={handleGoogleSignIn}
+            onManualAuth={handleManualAuth}
+            onGoogleSignIn={handleGoogleSignIn}
             onSignOut={handleSignOut}
+            getAuthToken={getAuthToken}
             onBack={() => handleSelectTab('apps')}
             onPublished={handlePublished}
           />
@@ -290,6 +363,7 @@ export default function App() {
               app={detailData.app}
               reviews={detailData.reviews}
               currentUser={currentUser}
+              getAuthToken={getAuthToken}
               onBack={() => {
                 setSelectedAppId(null);
                 setDetailData(null);

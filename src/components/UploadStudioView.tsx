@@ -1,28 +1,42 @@
 import { useEffect, useRef, useState } from 'react';
 import type { DragEvent, FormEvent } from 'react';
-import type { User } from 'firebase/auth';
 import {
   ArrowRight,
   CheckCircle2,
   FileArchive,
   ImagePlus,
+  Lock,
   LogOut,
+  Mail,
   Package,
   RefreshCw,
   ShieldCheck,
   Sparkles,
   Upload,
+  User as UserIcon,
   X,
 } from 'lucide-react';
-import type { AppCategory, ExtractedApkInfo, StoreApp } from '../types.ts';
+import type {
+  AppCategory,
+  DeveloperSessionUser,
+  ExtractedApkInfo,
+  StoreApp,
+} from '../types.ts';
 import { parseApkFile } from '../utils/apkParser.ts';
 
 interface UploadStudioViewProps {
-  user: User | null;
+  user: DeveloperSessionUser | null;
   authLoading: boolean;
   authError: string | null;
-  onSignIn: () => Promise<void>;
+  onManualAuth: (params: {
+    mode: 'login' | 'register';
+    name?: string;
+    email: string;
+    password: string;
+  }) => Promise<void>;
+  onGoogleSignIn: () => Promise<void>;
   onSignOut: () => Promise<void>;
+  getAuthToken: () => Promise<string | null>;
   onBack: () => void;
   onPublished: (newApp: StoreApp) => void;
 }
@@ -47,14 +61,23 @@ export function UploadStudioView({
   user,
   authLoading,
   authError,
-  onSignIn,
+  onManualAuth,
+  onGoogleSignIn,
   onSignOut,
+  getAuthToken,
   onBack,
   onPublished,
 }: UploadStudioViewProps) {
   const apkInputRef = useRef<HTMLInputElement>(null);
   const customIconInputRef = useRef<HTMLInputElement>(null);
   const screenshotsInputRef = useRef<HTMLInputElement>(null);
+
+  // Manual Auth form state
+  const [authMode, setAuthMode] = useState<'register' | 'login'>('register');
+  const [authName, setAuthName] = useState('');
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
 
   const [apkFile, setApkFile] = useState<File | null>(null);
   const [parsingApk, setParsingApk] = useState(false);
@@ -187,7 +210,7 @@ export function UploadStudioView({
     setError(null);
 
     if (!user) {
-      setError('يجب تسجيل الدخول بحساب جوجل قبل رفع التطبيق.');
+      setError('يجب تسجيل الدخول بحساب المطور قبل رفع التطبيق.');
       return;
     }
 
@@ -204,11 +227,14 @@ export function UploadStudioView({
       return;
     }
 
-    let idToken = '';
+    let idToken: string | null = null;
     try {
-      idToken = await user.getIdToken();
+      idToken = await getAuthToken();
     } catch {
-      setError('انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول بحساب جوجل.');
+      idToken = null;
+    }
+    if (!idToken) {
+      setError('انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول.');
       return;
     }
 
@@ -290,9 +316,24 @@ export function UploadStudioView({
     );
   }
 
+  const handleManualSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    setAuthSubmitting(true);
+    try {
+      await onManualAuth({
+        mode: authMode,
+        name: authMode === 'register' ? authName : undefined,
+        email: authEmail,
+        password: authPassword,
+      });
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
   if (!user) {
     return (
-      <div className="max-w-2xl mx-auto px-4 sm:px-6 lg:px-8 py-12 space-y-6">
+      <div className="max-w-xl mx-auto px-4 sm:px-6 lg:px-8 py-10 space-y-6">
         <button
           type="button"
           onClick={onBack}
@@ -302,53 +343,159 @@ export function UploadStudioView({
           <span>العودة إلى المتجر</span>
         </button>
 
-        <div className="p-8 sm:p-10 bg-[#F8F9FA] border border-[#E8EAED] rounded-3xl text-center space-y-5">
-          <div className="w-14 h-14 mx-auto rounded-2xl bg-[#01875F]/10 text-[#01875F] flex items-center justify-center">
-            <ShieldCheck className="w-7 h-7" />
-          </div>
-
-          <div className="space-y-2">
+        <div className="p-6 sm:p-8 bg-[#F8F9FA] border border-[#E8EAED] rounded-3xl space-y-6">
+          <div className="text-center space-y-2">
+            <div className="w-12 h-12 mx-auto rounded-2xl bg-[#01875F]/10 text-[#01875F] flex items-center justify-center">
+              <ShieldCheck className="w-6 h-6" />
+            </div>
             <h1 className="font-display text-2xl font-bold text-[#202124]">
-              تسجيل دخول المطور بحساب جوجل
+              حساب المطور
             </h1>
-            <p className="text-sm text-[#5F6368] max-w-md mx-auto leading-relaxed">
-              لضمان موثوقية التطبيقات وحماية المستخدمين، يجب تسجيل الدخول بحساب جوجل الخاص بك قبل رفع ملفات APK ونشرها في المتجر.
+            <p className="text-sm text-[#5F6368] leading-relaxed">
+              سجّل دخولك أو أنشئ حساب مطور بالاسم والبريد الإلكتروني وكلمة المرور لرفع ملفات APK وإدارة تطبيقاتك.
             </p>
           </div>
 
-          {authError && (
-            <div className="p-3.5 bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl">
-              {authError}
-            </div>
-          )}
-
-          <div className="pt-2">
+          {/* Segmented Tabs: Register vs Login */}
+          <div className="grid grid-cols-2 gap-1 p-1 bg-[#E8EAED]/70 rounded-xl">
             <button
               type="button"
-              onClick={() => void onSignIn()}
-              className="inline-flex items-center justify-center gap-3 px-7 py-3.5 text-sm font-semibold text-[#202124] bg-white hover:bg-[#F1F3F4] border border-[#DADCE0] rounded-xl transition-colors shadow-xs"
+              onClick={() => setAuthMode('register')}
+              className={`py-2 text-xs font-semibold rounded-lg transition-colors ${
+                authMode === 'register'
+                  ? 'bg-white text-[#202124] shadow-xs'
+                  : 'text-[#5F6368] hover:text-[#202124]'
+              }`}
             >
-              <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
-                <path
-                  fill="#4285F4"
-                  d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
-                />
-                <path
-                  fill="#34A853"
-                  d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
-                />
-                <path
-                  fill="#FBBC05"
-                  d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
-                />
-                <path
-                  fill="#EA4335"
-                  d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
-                />
-              </svg>
-              <span>تسجيل الدخول بحساب جوجل</span>
+              إنشاء حساب جديد
+            </button>
+            <button
+              type="button"
+              onClick={() => setAuthMode('login')}
+              className={`py-2 text-xs font-semibold rounded-lg transition-colors ${
+                authMode === 'login'
+                  ? 'bg-white text-[#202124] shadow-xs'
+                  : 'text-[#5F6368] hover:text-[#202124]'
+              }`}
+            >
+              تسجيل الدخول
             </button>
           </div>
+
+          <form onSubmit={handleManualSubmit} className="space-y-4">
+            {authMode === 'register' && (
+              <div>
+                <label htmlFor="dev-auth-name" className="block text-xs font-semibold text-[#3C4043] mb-1.5">
+                  الاسم الكامل للمطور
+                </label>
+                <div className="relative">
+                  <UserIcon className="w-4 h-4 text-[#5F6368] absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    id="dev-auth-name"
+                    type="text"
+                    required
+                    minLength={2}
+                    maxLength={80}
+                    value={authName}
+                    onChange={(e) => setAuthName(e.target.value)}
+                    placeholder="مثال: أحمد السالم"
+                    className="w-full pr-10 pl-3.5 py-2.5 text-sm bg-white border border-[#DADCE0] rounded-xl focus:outline-none focus:border-[#01875F]"
+                  />
+                </div>
+              </div>
+            )}
+
+            <div>
+              <label htmlFor="dev-auth-email" className="block text-xs font-semibold text-[#3C4043] mb-1.5">
+                البريد الإلكتروني
+              </label>
+              <div className="relative">
+                <Mail className="w-4 h-4 text-[#5F6368] absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  id="dev-auth-email"
+                  type="email"
+                  dir="ltr"
+                  required
+                  value={authEmail}
+                  onChange={(e) => setAuthEmail(e.target.value)}
+                  placeholder="developer@example.com"
+                  className="w-full pr-10 pl-3.5 py-2.5 text-sm bg-white border border-[#DADCE0] rounded-xl focus:outline-none focus:border-[#01875F]"
+                />
+              </div>
+            </div>
+
+            <div>
+              <label htmlFor="dev-auth-password" className="block text-xs font-semibold text-[#3C4043] mb-1.5">
+                كلمة المرور
+              </label>
+              <div className="relative">
+                <Lock className="w-4 h-4 text-[#5F6368] absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  id="dev-auth-password"
+                  type="password"
+                  dir="ltr"
+                  required
+                  minLength={8}
+                  maxLength={128}
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  placeholder="8 أحرف على الأقل"
+                  className="w-full pr-10 pl-3.5 py-2.5 text-sm bg-white border border-[#DADCE0] rounded-xl focus:outline-none focus:border-[#01875F]"
+                />
+              </div>
+            </div>
+
+            {authError && (
+              <div className="p-3.5 bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl leading-relaxed">
+                {authError}
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={authSubmitting}
+              className="w-full py-3 text-sm font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] disabled:opacity-60 rounded-xl transition-colors shadow-xs"
+            >
+              {authSubmitting
+                ? 'جاري التحقق...'
+                : authMode === 'register'
+                ? 'إنشاء الحساب والمتابعة'
+                : 'تسجيل الدخول'}
+            </button>
+          </form>
+
+          <div className="relative flex items-center justify-center">
+            <div className="w-full border-t border-[#E8EAED]" />
+            <span className="px-3 text-xs text-[#5F6368] bg-[#F8F9FA] shrink-0">
+              أو المتابعة عبر
+            </span>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => void onGoogleSignIn()}
+            className="w-full inline-flex items-center justify-center gap-3 px-6 py-3 text-sm font-semibold text-[#202124] bg-white hover:bg-[#F1F3F4] border border-[#DADCE0] rounded-xl transition-colors"
+          >
+            <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+              <path
+                fill="#4285F4"
+                d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+              />
+              <path
+                fill="#34A853"
+                d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+              />
+              <path
+                fill="#FBBC05"
+                d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+              />
+              <path
+                fill="#EA4335"
+                d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+              />
+            </svg>
+            <span>تسجيل الدخول بحساب جوجل</span>
+          </button>
         </div>
       </div>
     );
