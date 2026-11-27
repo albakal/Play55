@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Smartphone } from 'lucide-react';
-import { resolveAssetUrl } from '../data/fallbackStore.ts';
+import { resolveAssetUrl } from '../catalog/fallbackStore.ts';
 
 interface AppIconProps {
   src: string;

@@ -25,7 +25,7 @@ import {
   BUNDLED_HERO_BANNER,
   FALLBACK_APPS,
   FALLBACK_REVIEWS,
-} from './data/fallbackStore.ts';
+} from './catalog/fallbackStore.ts';
 import { StoreHeader } from './components/StoreHeader.tsx';
 import type { NavTab } from './components/StoreHeader.tsx';
 import { AppIcon } from './components/AppIcon.tsx';

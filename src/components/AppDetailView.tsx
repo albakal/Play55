@@ -15,7 +15,7 @@ import {
   X,
 } from 'lucide-react';
 import type { DeveloperSessionUser, ReviewItem, StoreApp } from '../types.ts';
-import { resolveAssetUrl } from '../data/fallbackStore.ts';
+import { resolveAssetUrl } from '../catalog/fallbackStore.ts';
 import { AppIcon } from './AppIcon.tsx';
 import { StarRating } from './StarRating.tsx';
 
