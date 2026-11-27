@@ -86,10 +86,19 @@ export default function App() {
       await signInWithGoogle();
     } catch (err) {
       const msg = err instanceof Error ? err.message : '';
-      if (msg.includes('popup-closed-by-user')) {
+      const code = (err as { code?: string })?.code || '';
+      if (code === 'auth/popup-closed-by-user' || msg.includes('popup-closed-by-user')) {
         setAuthError('تم إغلاق نافذة تسجيل الدخول قبل إتمام العملية.');
+      } else if (code === 'auth/unauthorized-domain' || msg.includes('unauthorized-domain')) {
+        setAuthError(
+          `النطاق (${window.location.hostname}) غير مضاف في النطاقات المصرح بها (Authorized domains) في Firebase Authentication. أضفه من لوحة Firebase أو استخدم رابط التطبيق المباشر في AI Studio.`
+        );
+      } else if (code === 'auth/popup-blocked' || msg.includes('popup-blocked')) {
+        setAuthError('حظر المتصفح نافذة تسجيل الدخول المنبثقة. يرجى السماح بالنوافذ المنبثقة أو الفتح في متصفح Chrome.');
       } else {
-        setAuthError('تعذر تسجيل الدخول بحساب جوجل، يرجى المحاولة مرة أخرى.');
+        setAuthError(
+          `تعذر تسجيل الدخول بحساب جوجل (${code || 'خطأ غير معروف'})، يرجى المحاولة مرة أخرى.`
+        );
       }
     }
   };

@@ -10,12 +10,12 @@ interface StoreHeaderProps {
 export function StoreHeader({ activeTab, onSelectTab }: StoreHeaderProps) {
   return (
     <header className="sticky top-0 z-30 bg-white/95 backdrop-blur-md border-b border-[#E8EAED]">
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-8">
+      <div className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 h-16 flex items-center justify-between gap-3 md:gap-8">
         {/* Zone 1: Brand Wordmark */}
         <button
           type="button"
           onClick={() => onSelectTab('apps')}
-          className="flex items-center gap-2.5 text-[#202124] hover:opacity-85 transition-opacity whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-[#01875F] rounded-lg"
+          className="flex items-center gap-2 text-[#202124] hover:opacity-85 transition-opacity whitespace-nowrap shrink-0 focus-visible:outline-2 focus-visible:outline-[#01875F] rounded-lg"
         >
           <span className="w-8 h-8 rounded-xl bg-[#01875F] text-white flex items-center justify-center shadow-xs shrink-0">
             <svg
@@ -34,7 +34,7 @@ export function StoreHeader({ activeTab, onSelectTab }: StoreHeaderProps) {
               />
             </svg>
           </span>
-          <span className="font-display text-lg font-bold tracking-tight">
+          <span className="font-display text-base sm:text-lg font-bold tracking-tight">
             متجر تطبيقات بلس
           </span>
         </button>
@@ -92,9 +92,9 @@ export function StoreHeader({ activeTab, onSelectTab }: StoreHeaderProps) {
           <button
             type="button"
             onClick={() => onSelectTab('upload')}
-            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] rounded-lg transition-colors whitespace-nowrap shrink-0 shadow-xs focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#01875F]"
+            className="inline-flex items-center gap-1.5 sm:gap-2 px-3 py-1.5 sm:px-4 sm:py-2 text-xs sm:text-sm font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] rounded-lg transition-colors whitespace-nowrap shrink-0 shadow-xs focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#01875F]"
           >
-            <Upload className="w-4 h-4" />
+            <Upload className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
             <span>رفع تطبيق APK</span>
           </button>
         </div>
