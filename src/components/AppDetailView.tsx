@@ -16,6 +16,13 @@ import {
 } from 'lucide-react';
 import type { DeveloperSessionUser, ReviewItem, StoreApp } from '../types.ts';
 import { resolveAssetUrl } from '../catalog/fallbackStore.ts';
+import {
+  localBuildOrFetchApkBlob,
+  localDeleteApp,
+  localIncrementInstall,
+  localSubmitReview,
+  localVoteHelpful,
+} from '../utils/localStoreEngine.ts';
 import { AppIcon } from './AppIcon.tsx';
 import { StarRating } from './StarRating.tsx';
 
@@ -84,14 +91,34 @@ export function AppDetailView({
 
   useEffect(() => {
     if (!showQrPanel) return;
-    const directUrl = `${window.location.origin}/api/apps/${encodeURIComponent(app.id)}/install-apk`;
-    QRCode.toDataURL(directUrl, {
-      width: 220,
-      margin: 2,
-      color: { dark: '#202124', light: '#FFFFFF' },
-    })
-      .then((url) => setQrDataUrl(url))
-      .catch(() => setQrDataUrl(''));
+    let cancelled = false;
+    (async () => {
+      let qrTarget = `${window.location.origin}${window.location.pathname}?app=${encodeURIComponent(app.id)}`;
+      try {
+        const res = await fetch('./api/health');
+        const ct = res.headers.get('content-type') || '';
+        if (res.ok && ct.includes('application/json')) {
+          qrTarget = `${window.location.origin}/api/apps/${encodeURIComponent(app.id)}/install-apk`;
+        }
+      } catch {
+        // Static fallback URL already selected
+      }
+      if (cancelled) return;
+      QRCode.toDataURL(qrTarget, {
+        width: 220,
+        margin: 2,
+        color: { dark: '#202124', light: '#FFFFFF' },
+      })
+        .then((url) => {
+          if (!cancelled) setQrDataUrl(url);
+        })
+        .catch(() => {
+          if (!cancelled) setQrDataUrl('');
+        });
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, [showQrPanel, app.id]);
 
   const handleDirectInstall = async () => {
@@ -103,16 +130,26 @@ export function AppDetailView({
       setInstallProgress((prev) => (prev < 88 ? prev + 14 : prev));
     }, 120);
 
+    let backendOnline = false;
     try {
-      const res = await fetch(`/api/apps/${encodeURIComponent(app.id)}/install`, {
+      const res = await fetch(`./api/apps/${encodeURIComponent(app.id)}/install`, {
         method: 'POST',
       });
-      if (res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
+        backendOnline = true;
         const data = (await res.json()) as { downloads: number };
         onAppUpdated({ ...app, downloads: data.downloads });
       }
     } catch {
-      // Continue direct package handoff even if telemetry update fails
+      backendOnline = false;
+    }
+
+    let localApkBlob: Blob | null = null;
+    if (!backendOnline) {
+      const nextDownloads = await localIncrementInstall(app).catch(() => app.downloads + 1);
+      onAppUpdated({ ...app, downloads: nextDownloads });
+      localApkBlob = await localBuildOrFetchApkBlob(app);
     }
 
     window.setTimeout(() => {
@@ -121,13 +158,24 @@ export function AppDetailView({
       setInstallPhase('done');
 
       // Trigger direct APK package handoff to Android Package Installer
-      const installEndpoint = `/api/apps/${encodeURIComponent(app.id)}/install-apk`;
-      const link = document.createElement('a');
-      link.href = installEndpoint;
-      link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
+      if (backendOnline) {
+        const installEndpoint = `./api/apps/${encodeURIComponent(app.id)}/install-apk`;
+        const link = document.createElement('a');
+        link.href = installEndpoint;
+        link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      } else if (localApkBlob) {
+        const blobUrl = URL.createObjectURL(localApkBlob);
+        const link = document.createElement('a');
+        link.href = blobUrl;
+        link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+        window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+      }
 
       // On non-Android desktop browsers, also open QR panel for instant phone handoff
       const isAndroid = /android/i.test(navigator.userAgent);
@@ -138,7 +186,7 @@ export function AppDetailView({
   };
 
   const handleShare = async () => {
-    const shareUrl = `${window.location.origin}/?app=${encodeURIComponent(app.id)}`;
+    const shareUrl = `${window.location.origin}${window.location.pathname}?app=${encodeURIComponent(app.id)}`;
     try {
       await navigator.clipboard.writeText(shareUrl);
       setCopiedShare(true);
@@ -164,7 +212,7 @@ export function AppDetailView({
 
     setSubmittingReview(true);
     try {
-      const res = await fetch(`/api/apps/${encodeURIComponent(app.id)}/reviews`, {
+      const res = await fetch(`./api/apps/${encodeURIComponent(app.id)}/reviews`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -173,6 +221,22 @@ export function AppDetailView({
           comment: commentInput.trim(),
         }),
       });
+
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json') || res.status === 405) {
+        const localSaved = await localSubmitReview({
+          app,
+          authorName: authorInput.trim(),
+          rating: ratingInput,
+          comment: commentInput.trim(),
+        });
+        onAppUpdated(localSaved.app, [localSaved.review, ...reviews]);
+        setAuthorInput('');
+        setCommentInput('');
+        setRatingInput(5);
+        setReviewSuccess(true);
+        return;
+      }
 
       const payload = (await res.json()) as {
         error?: string;
@@ -191,7 +255,21 @@ export function AppDetailView({
       setRatingInput(5);
       setReviewSuccess(true);
     } catch {
-      setReviewError('تعذر الاتصال بالخادم أثناء إرسال المراجعة.');
+      try {
+        const localSaved = await localSubmitReview({
+          app,
+          authorName: authorInput.trim(),
+          rating: ratingInput,
+          comment: commentInput.trim(),
+        });
+        onAppUpdated(localSaved.app, [localSaved.review, ...reviews]);
+        setAuthorInput('');
+        setCommentInput('');
+        setRatingInput(5);
+        setReviewSuccess(true);
+      } catch {
+        setReviewError('تعذر حفظ المراجعة، يرجى المحاولة مجدداً.');
+      }
     } finally {
       setSubmittingReview(false);
     }
@@ -200,21 +278,31 @@ export function AppDetailView({
   const handleHelpful = async (reviewId: string) => {
     if (helpfulVoted[reviewId]) return;
     setHelpfulVoted((prev) => ({ ...prev, [reviewId]: true }));
+    const targetReview = reviews.find((r) => r.id === reviewId);
     try {
       const res = await fetch(
-        `/api/apps/${encodeURIComponent(app.id)}/reviews/${encodeURIComponent(reviewId)}/helpful`,
+        `./api/apps/${encodeURIComponent(app.id)}/reviews/${encodeURIComponent(reviewId)}/helpful`,
         { method: 'POST' }
       );
-      if (res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
         const data = (await res.json()) as { helpfulCount: number };
         const updated = reviews.map((r) =>
           r.id === reviewId ? { ...r, helpfulCount: data.helpfulCount } : r
         );
         onAppUpdated(app, updated);
+        return;
       }
     } catch {
-      // Ignore network hiccup
+      // Fallback below
     }
+    const nextCount = await localVoteHelpful(reviewId, targetReview?.helpfulCount ?? 0).catch(
+      () => (targetReview?.helpfulCount ?? 0) + 1
+    );
+    const updated = reviews.map((r) =>
+      r.id === reviewId ? { ...r, helpfulCount: nextCount } : r
+    );
+    onAppUpdated(app, updated);
   };
 
   const handleDeleteApp = async () => {
@@ -228,11 +316,18 @@ export function AppDetailView({
           Authorization: `Bearer ${token}`,
         },
       });
-      if (res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
         onAppDeleted(app.id);
+        return;
+      }
+      if (res.status === 404 || res.status === 405 || !contentType.includes('application/json')) {
+        const deleted = await localDeleteApp(app.id, currentUser.uid);
+        if (deleted) onAppDeleted(app.id);
       }
     } catch {
-      // Ignore
+      const deleted = await localDeleteApp(app.id, currentUser.uid).catch(() => false);
+      if (deleted) onAppDeleted(app.id);
     }
   };
 

@@ -666,6 +666,11 @@ async function startServer() {
   // Static uploaded media
   app.use('/uploads', express.static(UPLOADS_DIR));
 
+  // Health check for full-stack runtime detection
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true, mode: 'fullstack' });
+  });
+
   // Manual Developer Auth: Register
   app.post('/api/auth/register', async (req, res) => {
     const body = req.body as { name?: unknown; email?: unknown; password?: unknown };

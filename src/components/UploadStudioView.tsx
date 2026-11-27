@@ -23,6 +23,10 @@ import type {
   StoreApp,
 } from '../types.ts';
 import { parseApkFile } from '../utils/apkParser.ts';
+import {
+  buildSampleApkFileClient,
+  localPublishApp,
+} from '../utils/localStoreEngine.ts';
 
 interface UploadStudioViewProps {
   user: DeveloperSessionUser | null;
@@ -143,12 +147,24 @@ export function UploadStudioView({
     setError(null);
     setParsingApk(true);
     try {
-      const res = await fetch('/api/sample-apk');
-      if (!res.ok) throw new Error('Failed');
-      const blob = await res.blob();
-      const sampleFile = new File([blob], 'noor-smartnotes-v2.4.0.apk', {
-        type: 'application/vnd.android.package-archive',
-      });
+      let sampleFile: File | null = null;
+      try {
+        const res = await fetch('./api/sample-apk');
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && !contentType.includes('text/html')) {
+          const blob = await res.blob();
+          sampleFile = new File([blob], 'noor-smartnotes-v2.4.0.apk', {
+            type: 'application/vnd.android.package-archive',
+          });
+        }
+      } catch {
+        sampleFile = null;
+      }
+
+      if (!sampleFile) {
+        sampleFile = await buildSampleApkFileClient();
+      }
+
       await processApkFile(sampleFile);
       if (!developer.trim()) setDeveloper('مختبرات نور الرقمية');
       if (!shortDescription.trim()) {
@@ -160,7 +176,7 @@ export function UploadStudioView({
         );
       }
     } catch {
-      setError('تعذر تحميل ملف APK النموذجي، يمكنك اختيار ملف APK من جهازك مباشرة.');
+      setError('تعذر تجهيز ملف APK النموذجي، يمكنك اختيار ملف APK من جهازك مباشرة.');
       setParsingApk(false);
     }
   };
@@ -268,8 +284,40 @@ export function UploadStudioView({
     setUploading(true);
     setUploadProgress(0);
 
+    const publishLocally = async () => {
+      try {
+        setUploadProgress(60);
+        const iconBlob = customIconFile || extracted?.iconBlob || null;
+        const newApp = await localPublishApp({
+          apkFile,
+          iconSource: iconBlob,
+          screenshots: screenshots.map((s) => s.file),
+          name: name.trim(),
+          developer: developer.trim() || user.displayName || 'مطور مستقل',
+          category,
+          shortDescription: shortDescription.trim(),
+          fullDescription: fullDescription.trim() || shortDescription.trim(),
+          whatsNew: whatsNew.trim(),
+          packageName: packageName.trim() || extracted?.packageName || 'com.app.android',
+          versionName: versionName.trim() || extracted?.versionName || '1.0.0',
+          versionCode: versionCode.trim() || extracted?.versionCode || '1',
+          minAndroid: minAndroid.trim() || 'Android 8.0+',
+          ageRating,
+          sizeMB: extracted?.sizeMB || 1,
+          permissionsCount: extracted?.permissionsCount || 0,
+          owner: user,
+        });
+        setUploadProgress(100);
+        setUploading(false);
+        onPublished(newApp);
+      } catch {
+        setUploading(false);
+        setError('حدث خطأ أثناء حفظ ملف APK محلياً في المتصفح.');
+      }
+    };
+
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/apps');
+    xhr.open('POST', './api/apps');
     xhr.setRequestHeader('Authorization', `Bearer ${idToken}`);
 
     xhr.upload.onprogress = (event) => {
@@ -279,15 +327,19 @@ export function UploadStudioView({
     };
 
     xhr.onload = () => {
-      setUploading(false);
-      if (xhr.status >= 200 && xhr.status < 300) {
+      const contentType = xhr.getResponseHeader('content-type') || '';
+      if (xhr.status >= 200 && xhr.status < 300 && contentType.includes('application/json')) {
+        setUploading(false);
         try {
           const parsed = JSON.parse(xhr.responseText) as { app: StoreApp };
           onPublished(parsed.app);
         } catch {
           setError('تم الرفع ولكن تعذر قراءة استجابة الخادم.');
         }
+      } else if (xhr.status === 404 || xhr.status === 405 || !contentType.includes('application/json')) {
+        void publishLocally();
       } else {
+        setUploading(false);
         try {
           const parsed = JSON.parse(xhr.responseText) as { error?: string };
           setError(parsed.error || 'فشل رفع التطبيق، تأكد من حجم الملفات وحاول مجدداً.');
@@ -298,8 +350,7 @@ export function UploadStudioView({
     };
 
     xhr.onerror = () => {
-      setUploading(false);
-      setError('تعذر الاتصال بالخادم أثناء رفع ملف APK.');
+      void publishLocally();
     };
 
     xhr.send(formData);

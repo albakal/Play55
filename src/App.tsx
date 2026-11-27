@@ -24,8 +24,15 @@ import {
 import {
   BUNDLED_HERO_BANNER,
   FALLBACK_APPS,
-  FALLBACK_REVIEWS,
 } from './catalog/fallbackStore.ts';
+import {
+  localBuildOrFetchApkBlob,
+  localGetAppDetail,
+  localIncrementInstall,
+  localListApps,
+  localLoginDeveloper,
+  localRegisterDeveloper,
+} from './utils/localStoreEngine.ts';
 import { StoreHeader } from './components/StoreHeader.tsx';
 import type { NavTab } from './components/StoreHeader.tsx';
 import { AppIcon } from './components/AppIcon.tsx';
@@ -115,10 +122,21 @@ export default function App() {
         }),
       });
       const contentType = res.headers.get('content-type') || '';
-      if (!contentType.includes('application/json')) {
-        setAuthError(
-          'خادم المصادقة ورفع ملفات APK غير متصل على الاستضافة الثابتة. يرجى فتح رابط التطبيق الكامل من AI Studio.'
-        );
+      if (!contentType.includes('application/json') || res.status === 405) {
+        // Static hosting fallback (e.g. GitHub Pages): use client-side Web Crypto + IndexedDB
+        const localResult =
+          params.mode === 'register'
+            ? await localRegisterDeveloper({
+                name: params.name || '',
+                email: params.email,
+                password: params.password,
+              })
+            : await localLoginDeveloper({
+                email: params.email,
+                password: params.password,
+              });
+        setManualToken(localResult.token);
+        setCurrentUser(localResult.user);
         return;
       }
       const data = (await res.json()) as {
@@ -132,8 +150,32 @@ export default function App() {
       }
       setManualToken(data.token);
       setCurrentUser(data.user);
-    } catch {
-      setAuthError('تعذر الاتصال بالخادم، يرجى المحاولة مرة أخرى.');
+    } catch (err) {
+      if (err instanceof Error && err.message && !err.message.includes('Failed to fetch')) {
+        setAuthError(err.message);
+        return;
+      }
+      try {
+        const localResult =
+          params.mode === 'register'
+            ? await localRegisterDeveloper({
+                name: params.name || '',
+                email: params.email,
+                password: params.password,
+              })
+            : await localLoginDeveloper({
+                email: params.email,
+                password: params.password,
+              });
+        setManualToken(localResult.token);
+        setCurrentUser(localResult.user);
+      } catch (localErr) {
+        setAuthError(
+          localErr instanceof Error
+            ? localErr.message
+            : 'تعذر إنشاء الحساب أو تسجيل الدخول، يرجى المحاولة مرة أخرى.'
+        );
+      }
     }
   };
 
@@ -148,19 +190,20 @@ export default function App() {
         setAuthError('تم إغلاق نافذة تسجيل الدخول قبل إتمام العملية.');
       } else if (code === 'auth/unauthorized-domain' || msg.includes('unauthorized-domain')) {
         setAuthError(
-          `النطاق (${window.location.hostname}) غير مضاف في النطاقات المصرح بها (Authorized domains) في Firebase. يمكنك التسجيل يدوياً بالأعلى عبر الاسم والبريد وكلمة المرور أو فتح رابط AI Studio المباشر.`
+          `النطاق (${window.location.hostname}) غير مضاف في النطاقات المصرح بها لحساب جوجل. يمكنك التسجيل أو الدخول يدوياً بالأعلى عبر الاسم والبريد وكلمة المرور مباشرة.`
         );
       } else if (code === 'auth/popup-blocked' || msg.includes('popup-blocked')) {
-        setAuthError('حظر المتصفح نافذة تسجيل الدخول المنبثقة. يمكنك التسجيل يدوياً أو السماح بالنوافذ المنبثقة.');
+        setAuthError('حظر المتصفح نافذة تسجيل الدخول المنبثقة. يمكنك التسجيل يدوياً بالأعلى أو السماح بالنوافذ المنبثقة.');
       } else {
         setAuthError(
-          `تعذر تسجيل الدخول بحساب جوجل (${code || 'خطأ غير معروف'})، يمكنك استخدام التسجيل اليدوي بالبريد وكلمة المرور.`
+          `تعذر تسجيل الدخول بحساب جوجل (${code || 'خطأ غير معروف'})، يمكنك استخدام التسجيل اليدوي بالأعلى مباشرة.`
         );
       }
     }
   };
 
   const handleSignOut = async () => {
+    setAuthError(null);
     setManualToken(null);
     setCurrentUser(null);
     await signOutDeveloper().catch(() => {});
@@ -181,9 +224,9 @@ export default function App() {
   const fetchApps = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
+    const sort: 'popular' | 'rating' | 'newest' =
+      activeTab === 'top-rated' ? 'rating' : activeTab === 'newest' ? 'newest' : 'popular';
     try {
-      const sort =
-        activeTab === 'top-rated' ? 'rating' : activeTab === 'newest' ? 'newest' : 'popular';
       const res = await fetch(`./api/apps?sort=${encodeURIComponent(sort)}`);
       const contentType = res.headers.get('content-type') || '';
       if (!res.ok || !contentType.includes('application/json')) {
@@ -192,15 +235,20 @@ export default function App() {
       const data = (await res.json()) as { apps: StoreApp[] };
       setApps(data.apps);
     } catch {
-      const sorted = [...FALLBACK_APPS];
-      if (activeTab === 'top-rated') {
-        sorted.sort((a, b) => b.averageRating - a.averageRating);
-      } else if (activeTab === 'newest') {
-        sorted.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-      } else {
-        sorted.sort((a, b) => b.downloads - a.downloads);
+      try {
+        const localApps = await localListApps(sort);
+        setApps(localApps);
+      } catch {
+        const sorted = [...FALLBACK_APPS];
+        if (sort === 'rating') {
+          sorted.sort((a, b) => b.averageRating - a.averageRating);
+        } else if (sort === 'newest') {
+          sorted.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+        } else {
+          sorted.sort((a, b) => b.downloads - a.downloads);
+        }
+        setApps(sorted);
       }
-      setApps(sorted);
     } finally {
       setLoading(false);
     }
@@ -220,9 +268,9 @@ export default function App() {
       const res = await fetch(`./api/apps/${encodeURIComponent(appId)}`);
       const contentType = res.headers.get('content-type') || '';
       if (!res.ok || !contentType.includes('application/json')) {
-        const localApp = FALLBACK_APPS.find((a) => a.id === appId);
-        if (localApp) {
-          setDetailData({ app: localApp, reviews: FALLBACK_REVIEWS[appId] || [] });
+        const localDetail = await localGetAppDetail(appId);
+        if (localDetail) {
+          setDetailData(localDetail);
           return;
         }
         setSelectedAppId(null);
@@ -232,9 +280,9 @@ export default function App() {
       const data = (await res.json()) as AppDetailResponse;
       setDetailData(data);
     } catch {
-      const localApp = FALLBACK_APPS.find((a) => a.id === appId);
-      if (localApp) {
-        setDetailData({ app: localApp, reviews: FALLBACK_REVIEWS[appId] || [] });
+      const localDetail = await localGetAppDetail(appId);
+      if (localDetail) {
+        setDetailData(localDetail);
       } else {
         setDetailData(null);
       }
@@ -276,26 +324,45 @@ export default function App() {
 
   const handleQuickInstall = async (app: StoreApp) => {
     setQuickInstallingId(app.id);
+    let backendOnline = false;
     try {
-      const res = await fetch(`/api/apps/${encodeURIComponent(app.id)}/install`, {
+      const res = await fetch(`./api/apps/${encodeURIComponent(app.id)}/install`, {
         method: 'POST',
       });
-      if (res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+      if (res.ok && contentType.includes('application/json')) {
+        backendOnline = true;
         const data = (await res.json()) as { downloads: number };
         setApps((prev) =>
           prev.map((a) => (a.id === app.id ? { ...a, downloads: data.downloads } : a))
         );
       }
     } catch {
-      // Proceed with direct APK handoff
+      backendOnline = false;
     }
 
-    const link = document.createElement('a');
-    link.href = `/api/apps/${encodeURIComponent(app.id)}/install-apk`;
-    link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    if (backendOnline) {
+      const link = document.createElement('a');
+      link.href = `./api/apps/${encodeURIComponent(app.id)}/install-apk`;
+      link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } else {
+      const nextDownloads = await localIncrementInstall(app).catch(() => app.downloads + 1);
+      setApps((prev) =>
+        prev.map((a) => (a.id === app.id ? { ...a, downloads: nextDownloads } : a))
+      );
+      const apkBlob = await localBuildOrFetchApkBlob(app);
+      const blobUrl = URL.createObjectURL(apkBlob);
+      const link = document.createElement('a');
+      link.href = blobUrl;
+      link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
+    }
 
     window.setTimeout(() => {
       setQuickInstallingId(null);
