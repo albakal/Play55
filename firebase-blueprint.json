@@ -40,6 +40,215 @@
         }
       },
       "required": ["uid", "displayName", "email", "createdAt", "updatedAt"]
+    },
+    "StoreAppItem": {
+      "title": "StoreAppItem",
+      "description": "Public Play55 Android application listing shared across all visitors and devices via permanent ?app=APP_ID links (no PII stored).",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "developer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "category": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "shortDescription": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "fullDescription": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 5000
+        },
+        "whatsNew": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "packageName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "versionName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "versionCode": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32
+        },
+        "minAndroid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "ageRating": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16
+        },
+        "sizeMB": {
+          "type": "number"
+        },
+        "iconUrl": {
+          "type": "string",
+          "maxLength": 120000
+        },
+        "screenshots": {
+          "type": "array",
+          "description": "Up to 4 promotional image URLs or compressed thumbnails"
+        },
+        "apkFilename": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "hasCustomApk": {
+          "type": "boolean"
+        },
+        "isBinaryManifest": {
+          "type": "boolean"
+        },
+        "isSignedApk": {
+          "type": "boolean"
+        },
+        "signatureScheme": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "signerCertSha256": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "apkSha256": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "externalApkUrl": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "permissionsCount": {
+          "type": "integer"
+        },
+        "downloads": {
+          "type": "integer"
+        },
+        "averageRating": {
+          "type": "number"
+        },
+        "reviewCount": {
+          "type": "integer"
+        },
+        "ratingDistribution": {
+          "type": "object"
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "developer",
+        "category",
+        "shortDescription",
+        "fullDescription",
+        "whatsNew",
+        "packageName",
+        "versionName",
+        "versionCode",
+        "minAndroid",
+        "ageRating",
+        "sizeMB",
+        "iconUrl",
+        "screenshots",
+        "apkFilename",
+        "hasCustomApk",
+        "permissionsCount",
+        "downloads",
+        "averageRating",
+        "reviewCount",
+        "ratingDistribution",
+        "ownerUid",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AppReview": {
+      "title": "AppReview",
+      "description": "User review for an app in the Play55 store.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "appId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "authorUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "authorName": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 60
+        },
+        "rating": {
+          "type": "integer"
+        },
+        "comment": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 1200
+        },
+        "helpfulCount": {
+          "type": "integer"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "appId", "authorUid", "authorName", "rating", "comment", "helpfulCount", "createdAt"]
     }
   },
   "firestore": {
@@ -48,6 +257,18 @@
         "$ref": "#/entities/DeveloperProfile"
       },
       "description": "Private developer profile documents keyed by authenticated Firebase UID."
+    },
+    "/apps/{appId}": {
+      "schema": {
+        "$ref": "#/entities/StoreAppItem"
+      },
+      "description": "Public Play55 application listings readable by any visitor and writable only by the authenticated ownerUid."
+    },
+    "/apps/{appId}/reviews/{reviewId}": {
+      "schema": {
+        "$ref": "#/entities/AppReview"
+      },
+      "description": "Public reviews for a specific application."
     }
   }
 }

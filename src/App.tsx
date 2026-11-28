@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { onAuthStateChanged } from 'firebase/auth';
 import {
   ArrowUpLeft,
@@ -18,6 +18,9 @@ import type {
 } from './types.ts';
 import {
   auth,
+  cloudGetAppDetail,
+  cloudListApps,
+  cloudPublishOrUpdateApp,
   signInWithGoogle,
   signOutDeveloper,
   syncDeveloperProfile,
@@ -31,9 +34,11 @@ import {
   localClearSession,
   localGetAppDetail,
   localGetSession,
+  localHasStoredApkBlob,
   localIncrementInstall,
   localListApps,
   localLoginDeveloper,
+  localMarkAppSynced,
   localRegisterDeveloper,
   localSaveSession,
   localVerifyApkBlob,
@@ -45,6 +50,11 @@ import {
   recordAppDownload,
 } from './utils/installHistory.ts';
 import type { DownloadedAppRecord } from './utils/installHistory.ts';
+import {
+  decodeSharedAppSnapshot,
+  extractAppIdFromLocation,
+  FALLBACK_APP_IDS,
+} from './utils/shareLink.ts';
 import { StoreHeader } from './components/StoreHeader.tsx';
 import type { NavTab } from './components/StoreHeader.tsx';
 import { AppIcon } from './components/AppIcon.tsx';
@@ -77,10 +87,9 @@ export default function App() {
   const [selectedCategory, setSelectedCategory] = useState<'الكل' | AppCategory>('الكل');
   const [searchQuery, setSearchQuery] = useState('');
 
-  const [selectedAppId, setSelectedAppId] = useState<string | null>(() => {
-    const params = new URLSearchParams(window.location.search);
-    return params.get('app');
-  });
+  const [selectedAppId, setSelectedAppId] = useState<string | null>(() =>
+    extractAppIdFromLocation()
+  );
   const [detailData, setDetailData] = useState<AppDetailResponse | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
@@ -300,11 +309,56 @@ export default function App() {
     return null;
   }, [manualToken]);
 
+  const autoSyncedIdsRef = useRef<Set<string>>(new Set());
+
+  const sortCatalogApps = useCallback(
+    (list: StoreApp[], sort: 'popular' | 'rating' | 'newest'): StoreApp[] => {
+      const next = [...list];
+      if (sort === 'rating') {
+        next.sort((a, b) => b.averageRating - a.averageRating || b.reviewCount - a.reviewCount);
+      } else if (sort === 'newest') {
+        next.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+      } else {
+        next.sort((a, b) => b.downloads - a.downloads);
+      }
+      return next;
+    },
+    []
+  );
+
+  const mergeAppLists = useCallback((primary: StoreApp[], secondary: StoreApp[]): StoreApp[] => {
+    const merged = new Map<string, StoreApp>();
+    for (const item of primary) {
+      merged.set(item.id, item);
+    }
+    for (const item of secondary) {
+      const existing = merged.get(item.id);
+      if (!existing) {
+        merged.set(item.id, item);
+      } else {
+        const existingTime = new Date(existing.updatedAt).getTime() || 0;
+        const incomingTime = new Date(item.updatedAt).getTime() || 0;
+        if (incomingTime > existingTime) {
+          merged.set(item.id, {
+            ...item,
+            syncedToCloud: existing.syncedToCloud || item.syncedToCloud,
+          });
+        } else if (item.syncedToCloud && !existing.syncedToCloud) {
+          merged.set(item.id, { ...existing, syncedToCloud: true });
+        }
+      }
+    }
+    return Array.from(merged.values());
+  }, []);
+
   const fetchApps = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
     const sort: 'popular' | 'rating' | 'newest' =
       activeTab === 'top-rated' ? 'rating' : activeTab === 'newest' ? 'newest' : 'popular';
+
+    const cloudPromise = cloudListApps().catch(() => [] as StoreApp[]);
+
     try {
       const res = await fetch(`./api/apps?sort=${encodeURIComponent(sort)}`);
       const contentType = res.headers.get('content-type') || '';
@@ -312,26 +366,24 @@ export default function App() {
         throw new Error('Static fallback');
       }
       const data = (await res.json()) as { apps: StoreApp[] };
-      setApps(data.apps);
+      const backendApps = data.apps.map((a) => ({ ...a, syncedToCloud: true }));
+      const cloudApps = await cloudPromise;
+      setApps(sortCatalogApps(mergeAppLists(backendApps, cloudApps), sort));
     } catch {
       try {
-        const localApps = await localListApps(sort);
-        setApps(localApps);
+        const [localApps, cloudApps] = await Promise.all([
+          localListApps(sort),
+          cloudPromise,
+        ]);
+        setApps(sortCatalogApps(mergeAppLists(localApps, cloudApps), sort));
       } catch {
-        const sorted = [...FALLBACK_APPS];
-        if (sort === 'rating') {
-          sorted.sort((a, b) => b.averageRating - a.averageRating);
-        } else if (sort === 'newest') {
-          sorted.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-        } else {
-          sorted.sort((a, b) => b.downloads - a.downloads);
-        }
-        setApps(sorted);
+        const cloudApps = await cloudPromise;
+        setApps(sortCatalogApps(mergeAppLists(FALLBACK_APPS, cloudApps), sort));
       }
     } finally {
       setLoading(false);
     }
-  }, [activeTab]);
+  }, [activeTab, mergeAppLists, sortCatalogApps]);
 
   useEffect(() => {
     if (activeTab !== 'upload') {
@@ -339,13 +391,59 @@ export default function App() {
     }
   }, [activeTab, fetchApps]);
 
+  useEffect(() => {
+    if (
+      !currentUser ||
+      currentUser.provider !== 'google' ||
+      !auth.currentUser?.emailVerified ||
+      apps.length === 0
+    ) {
+      return;
+    }
+
+    const candidates = apps.filter(
+      (a) =>
+        a.ownerUid === currentUser.uid &&
+        !a.syncedToCloud &&
+        !FALLBACK_APP_IDS.has(a.id) &&
+        !autoSyncedIdsRef.current.has(a.id)
+    );
+    if (candidates.length === 0) return;
+
+    let cancelled = false;
+    (async () => {
+      for (const item of candidates) {
+        autoSyncedIdsRef.current.add(item.id);
+        try {
+          const synced = await cloudPublishOrUpdateApp(item, false);
+          if (synced && !cancelled) {
+            await localMarkAppSynced(item.id, true);
+            setApps((prev) =>
+              prev.map((a) => (a.id === item.id ? { ...a, syncedToCloud: true } : a))
+            );
+          }
+        } catch {
+          // Non-fatal auto-sync attempt
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [apps, currentUser]);
+
   const syncAppQueryUrl = useCallback((appId: string | null) => {
     try {
       const url = new URL(window.location.href);
       if (appId) {
         url.searchParams.set('app', appId);
+        url.hash = '';
       } else {
         url.searchParams.delete('app');
+        if (url.hash.startsWith('#p55=') || url.hash.includes('app=')) {
+          url.hash = '';
+        }
       }
       window.history.pushState({ appId }, '', url.toString());
     } catch {
@@ -359,40 +457,53 @@ export default function App() {
       setDetailError(null);
       setLoadingDetail(true);
       if (pushHistory) {
-        const currentParam = new URLSearchParams(window.location.search).get('app');
+        const currentParam = extractAppIdFromLocation();
         if (currentParam !== appId) {
           syncAppQueryUrl(appId);
         }
       }
       window.scrollTo({ top: 0, behavior: 'smooth' });
+
       try {
-        const res = await fetch(`./api/apps/${encodeURIComponent(appId)}`);
-        const contentType = res.headers.get('content-type') || '';
-        if (!contentType.includes('application/json')) {
-          const localDetail = await localGetAppDetail(appId);
-          if (localDetail) {
-            setDetailData(localDetail);
-          } else {
-            setDetailData(null);
-            setDetailError('التطبيق المطلوب غير موجود أو تم حذفه.');
+        try {
+          const res = await fetch(`./api/apps/${encodeURIComponent(appId)}`);
+          const contentType = res.headers.get('content-type') || '';
+          if (res.ok && contentType.includes('application/json')) {
+            const data = (await res.json()) as AppDetailResponse;
+            setDetailData({
+              app: { ...data.app, syncedToCloud: true },
+              reviews: data.reviews,
+            });
+            return;
           }
-          return;
+        } catch {
+          // Backend unavailable, continue to Firestore / IndexedDB / URL snapshot
         }
-        if (!res.ok) {
-          setDetailData(null);
-          setDetailError('التطبيق المطلوب غير موجود أو تم حذفه.');
-          return;
+
+        try {
+          const cloudDetail = await cloudGetAppDetail(appId);
+          if (cloudDetail) {
+            setDetailData(cloudDetail);
+            return;
+          }
+        } catch {
+          // Continue to local store & URL snapshot fallback
         }
-        const data = (await res.json()) as AppDetailResponse;
-        setDetailData(data);
-      } catch {
-        const localDetail = await localGetAppDetail(appId);
+
+        const localDetail = await localGetAppDetail(appId).catch(() => null);
         if (localDetail) {
           setDetailData(localDetail);
-        } else {
-          setDetailData(null);
-          setDetailError('التطبيق المطلوب غير موجود أو تعذر تحميل بياناته.');
+          return;
         }
+
+        const snapshotApp = decodeSharedAppSnapshot(appId);
+        if (snapshotApp) {
+          setDetailData({ app: snapshotApp, reviews: [] });
+          return;
+        }
+
+        setDetailData(null);
+        setDetailError('التطبيق المطلوب غير موجود أو تم حذفه.');
       } finally {
         setLoadingDetail(false);
       }
@@ -408,7 +519,7 @@ export default function App() {
 
   useEffect(() => {
     const onPopState = () => {
-      const appParam = new URLSearchParams(window.location.search).get('app');
+      const appParam = extractAppIdFromLocation();
       if (appParam) {
         setActiveTab('apps');
         void openAppDetail(appParam, false);
@@ -430,7 +541,7 @@ export default function App() {
     setSelectedAppId(null);
     setDetailData(null);
     setDetailError(null);
-    if (new URLSearchParams(window.location.search).has('app')) {
+    if (extractAppIdFromLocation()) {
       syncAppQueryUrl(null);
     }
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -482,6 +593,18 @@ export default function App() {
 
     let resolvedExternalUrl: string | null = null;
     if (!backendOnline) {
+      const hasLocalBlob = await localHasStoredApkBlob(app.id);
+      const safeExternal =
+        app.externalApkUrl && /^https:\/\/[^\s@]+$/.test(app.externalApkUrl)
+          ? app.externalApkUrl
+          : null;
+      if (app.hasCustomApk && !safeExternal && !hasLocalBlob) {
+        setQuickInstallingId(null);
+        setQuickInstallError(
+          `«${app.name}» منشور على استضافة ثابتة بدون رابط HTTPS مباشر لملف APK؛ يرجى من المطور إضافة رابط التوزيع في صفحة التحديث أو النشر من خادم Play55 الكامل.`
+        );
+        return;
+      }
       const localCheck = await localVerifyApkBlob(app);
       if (!localCheck.valid) {
         setQuickInstallingId(null);
@@ -489,7 +612,7 @@ export default function App() {
         return;
       }
       resolvedSha256 = localCheck.sha256 || resolvedSha256;
-      resolvedExternalUrl = localCheck.externalApkUrl || null;
+      resolvedExternalUrl = localCheck.externalApkUrl || safeExternal || null;
       verified = true;
     }
 

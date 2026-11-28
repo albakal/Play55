@@ -46,6 +46,80 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
+    function isValidRatingDist(dist) {
+      return dist is map
+        && dist.keys().hasAll(['1', '2', '3', '4', '5'])
+        && dist.keys().hasOnly(['1', '2', '3', '4', '5'])
+        && dist['1'] is int && dist['1'] >= 0
+        && dist['2'] is int && dist['2'] >= 0
+        && dist['3'] is int && dist['3'] >= 0
+        && dist['4'] is int && dist['4'] >= 0
+        && dist['5'] is int && dist['5'] >= 0;
+    }
+
+    function isValidStoreApp(data) {
+      return data.keys().hasAll([
+          'id', 'name', 'developer', 'category', 'shortDescription', 'fullDescription',
+          'whatsNew', 'packageName', 'versionName', 'versionCode', 'minAndroid', 'ageRating',
+          'sizeMB', 'iconUrl', 'screenshots', 'apkFilename', 'hasCustomApk',
+          'permissionsCount', 'downloads', 'averageRating', 'reviewCount',
+          'ratingDistribution', 'ownerUid', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'name', 'developer', 'category', 'shortDescription', 'fullDescription',
+          'whatsNew', 'packageName', 'versionName', 'versionCode', 'minAndroid', 'ageRating',
+          'sizeMB', 'iconUrl', 'screenshots', 'apkFilename', 'hasCustomApk',
+          'isBinaryManifest', 'isSignedApk', 'signatureScheme', 'signerCertSha256',
+          'apkSha256', 'externalApkUrl', 'permissionsCount', 'downloads', 'averageRating',
+          'reviewCount', 'ratingDistribution', 'ownerUid', 'createdAt', 'updatedAt'
+        ])
+        && isValidId(data.id)
+        && data.name is string && data.name.size() >= 1 && data.name.size() <= 120
+        && data.developer is string && data.developer.size() >= 1 && data.developer.size() <= 120
+        && data.category is string && data.category.size() >= 1 && data.category.size() <= 40
+        && data.shortDescription is string && data.shortDescription.size() >= 1 && data.shortDescription.size() <= 240
+        && data.fullDescription is string && data.fullDescription.size() >= 1 && data.fullDescription.size() <= 5000
+        && data.whatsNew is string && data.whatsNew.size() <= 1000
+        && data.packageName is string && data.packageName.size() >= 1 && data.packageName.size() <= 160
+        && data.versionName is string && data.versionName.size() >= 1 && data.versionName.size() <= 64
+        && data.versionCode is string && data.versionCode.size() >= 1 && data.versionCode.size() <= 32
+        && data.minAndroid is string && data.minAndroid.size() >= 1 && data.minAndroid.size() <= 40
+        && data.ageRating is string && data.ageRating.size() >= 1 && data.ageRating.size() <= 16
+        && data.sizeMB is number && data.sizeMB > 0
+        && data.iconUrl is string && data.iconUrl.size() <= 120000
+        && data.screenshots is list && data.screenshots.size() <= 4
+        && (data.screenshots.size() == 0 || (data.screenshots[0] is string && data.screenshots[0].size() <= 120000))
+        && data.apkFilename is string && data.apkFilename.size() <= 200
+        && data.hasCustomApk is bool
+        && (!('isBinaryManifest' in data) || data.isBinaryManifest is bool)
+        && (!('isSignedApk' in data) || data.isSignedApk is bool)
+        && (!('signatureScheme' in data) || (data.signatureScheme is string && data.signatureScheme.size() <= 32))
+        && (!('signerCertSha256' in data) || (data.signerCertSha256 is string && data.signerCertSha256.size() <= 128))
+        && (!('apkSha256' in data) || (data.apkSha256 is string && data.apkSha256.size() <= 128))
+        && (!('externalApkUrl' in data) || (data.externalApkUrl is string && data.externalApkUrl.size() <= 500 && data.externalApkUrl.matches('^https://[^\\s@]+$')))
+        && data.permissionsCount is int && data.permissionsCount >= 0
+        && data.downloads is int && data.downloads >= 0
+        && data.averageRating is number && data.averageRating >= 0 && data.averageRating <= 5
+        && data.reviewCount is int && data.reviewCount >= 0
+        && isValidRatingDist(data.ratingDistribution)
+        && isValidId(data.ownerUid)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidAppReview(data) {
+      return data.keys().hasAll(['id', 'appId', 'authorUid', 'authorName', 'rating', 'comment', 'helpfulCount', 'createdAt'])
+        && data.keys().hasOnly(['id', 'appId', 'authorUid', 'authorName', 'rating', 'comment', 'helpfulCount', 'createdAt'])
+        && isValidId(data.id)
+        && isValidId(data.appId)
+        && isValidId(data.authorUid)
+        && data.authorName is string && data.authorName.size() >= 2 && data.authorName.size() <= 60
+        && data.rating is int && data.rating >= 1 && data.rating <= 5
+        && data.comment is string && data.comment.size() >= 4 && data.comment.size() <= 1200
+        && data.helpfulCount is int && data.helpfulCount >= 0
+        && data.createdAt is timestamp;
+    }
+
     match /developers/{userId} {
       allow get: if isValidId(userId) && isOwner(userId);
       allow list: if false;
@@ -66,6 +140,55 @@ service cloud.firestore {
         && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'email', 'photoUrl', 'updatedAt']);
 
       allow delete: if isValidId(userId) && isOwner(userId);
+    }
+
+    match /apps/{appId} {
+      allow get: if isValidId(appId);
+      allow list: if true;
+
+      allow create: if isValidId(appId)
+        && isSignedIn()
+        && isValidStoreApp(incoming())
+        && incoming().id == appId
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isValidId(appId)
+        && isSignedIn()
+        && isValidStoreApp(incoming())
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().id == existing().id
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && isOwner(existing().ownerUid)
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'name', 'developer', 'category', 'shortDescription', 'fullDescription',
+          'whatsNew', 'packageName', 'versionName', 'versionCode', 'minAndroid',
+          'ageRating', 'sizeMB', 'iconUrl', 'screenshots', 'apkFilename',
+          'hasCustomApk', 'isBinaryManifest', 'isSignedApk', 'signatureScheme',
+          'signerCertSha256', 'apkSha256', 'externalApkUrl', 'permissionsCount',
+          'updatedAt'
+        ]);
+
+      allow delete: if isValidId(appId) && isOwner(existing().ownerUid);
+
+      match /reviews/{reviewId} {
+        allow get: if isValidId(appId) && isValidId(reviewId);
+        allow list: if isValidId(appId);
+
+        allow create: if isValidId(appId)
+          && isValidId(reviewId)
+          && isSignedIn()
+          && isValidAppReview(incoming())
+          && incoming().id == reviewId
+          && incoming().appId == appId
+          && incoming().authorUid == request.auth.uid
+          && incoming().createdAt == request.time
+          && exists(/databases/$(database)/documents/apps/$(appId));
+
+        allow delete: if isValidId(appId) && isValidId(reviewId) && isOwner(existing().authorUid);
+      }
     }
   }
 }

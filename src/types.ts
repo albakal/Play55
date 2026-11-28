@@ -53,6 +53,7 @@ export interface StoreApp {
     1: number;
   };
   featured?: boolean;
+  syncedToCloud?: boolean;
   ownerUid?: string;
   ownerEmail?: string;
   createdAt: string;

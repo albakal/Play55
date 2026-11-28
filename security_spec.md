@@ -1,21 +1,21 @@
 # Firestore Security Specification
 
 ## 1. Data Invariants
-- Every document in `/developers/{userId}` belongs strictly to the authenticated, email-verified user whose `request.auth.uid == userId`.
-- `uid` and `createdAt` are immutable once created.
-- `createdAt` on create and `updatedAt` on create/update must equal `request.time`.
-- PII (`email`) is strictly isolated to owner-only `get` access; public reads and `list` queries on `/developers` are completely denied.
+- `/developers/{userId}` belongs strictly to the authenticated, email-verified user whose `request.auth.uid == userId`; PII (`email`) is isolated from public reads and `list` queries are denied.
+- `/apps/{appId}` stores ONLY public catalog metadata (never PII like `ownerEmail`); anyone may `get` or `list` published apps so permanent `?app=APP_ID` links work for unauthenticated visitors across devices.
+- Creating, updating, or deleting `/apps/{appId}` requires an authenticated, email-verified user whose `request.auth.uid == ownerUid`. `id`, `ownerUid`, and `createdAt` are immutable after creation; `createdAt` and `updatedAt` must equal `request.time`.
+- `/apps/{appId}/reviews/{reviewId}` requires an existing parent `/apps/{appId}` (`exists(...)`), authenticated `authorUid == request.auth.uid`, valid rating (`1..5`), and `createdAt == request.time`.
 
 ## 2. Adversarial Payloads ("Dirty Dozen")
 1. Unauthenticated `get` on `/developers/uid1` -> `PERMISSION_DENIED`
-2. Authenticated `get` on another user's `/developers/uid2` -> `PERMISSION_DENIED`
-3. Authenticated `list` query on `/developers` -> `PERMISSION_DENIED`
-4. Unverified email (`email_verified: false`) `create` on `/developers/uid1` -> `PERMISSION_DENIED`
-5. Identity spoofing (`uid: "other"`) on `create` `/developers/uid1` -> `PERMISSION_DENIED`
-6. Shadow field injection (`isAdmin: true`) on `create` -> `PERMISSION_DENIED`
-7. Shadow field injection (`role: "admin"`) on `update` -> `PERMISSION_DENIED`
-8. Mutating immutable `uid` on `update` -> `PERMISSION_DENIED`
-9. Mutating immutable `createdAt` on `update` -> `PERMISSION_DENIED`
-10. Client-forged timestamp (`updatedAt != request.time`) -> `PERMISSION_DENIED`
-11. Oversized `displayName` (> 100 chars) -> `PERMISSION_DENIED`
+2. Authenticated `list` query on `/developers` -> `PERMISSION_DENIED`
+3. Unauthenticated `create` on `/apps/app-123` -> `PERMISSION_DENIED`
+4. Identity spoofing (`ownerUid: "other"`) on `create` `/apps/app-123` -> `PERMISSION_DENIED`
+5. Shadow field injection (`ownerEmail` or `isAdmin: true`) on `create` `/apps/app-123` -> `PERMISSION_DENIED`
+6. Cross-owner `update` or `delete` on `/apps/app-123` -> `PERMISSION_DENIED`
+7. Mutating immutable `ownerUid` or `createdAt` on `update` `/apps/app-123` -> `PERMISSION_DENIED`
+8. Client-forged timestamp (`updatedAt != request.time`) on `/apps/app-123` -> `PERMISSION_DENIED`
+9. Non-HTTPS `externalApkUrl` (`javascript:alert(1)` or `http://...`) on `/apps/app-123` -> `PERMISSION_DENIED`
+10. Oversized `screenshots` array (> 4) or oversized string (`name` > 120) -> `PERMISSION_DENIED`
+11. Orphaned review on nonexistent `/apps/missing-id/reviews/rev-1` -> `PERMISSION_DENIED`
 12. Invalid path variable ID (`../bad-id`) -> `PERMISSION_DENIED`

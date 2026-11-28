@@ -28,12 +28,15 @@ import type {
   StoreApp,
 } from '../types.ts';
 import { resolveAssetUrl } from '../catalog/fallbackStore.ts';
+import { auth, cloudPublishOrUpdateApp } from '../firebase.ts';
 import { parseApkFile } from '../utils/apkParser.ts';
 import {
   buildSampleApkFileClient,
+  localMarkAppSynced,
   localPublishApp,
   localUpdateApp,
 } from '../utils/localStoreEngine.ts';
+import { buildPermanentAppShareUrl } from '../utils/shareLink.ts';
 import { AppIcon } from './AppIcon.tsx';
 
 interface UploadStudioViewProps {
@@ -167,15 +170,12 @@ export function UploadStudioView({
     }
   }, [editingApp]);
 
-  const buildPermanentLink = (appId: string) =>
-    `${window.location.origin}${window.location.pathname}?app=${encodeURIComponent(appId)}`;
-
-  const handleCopyAppLink = async (appId: string) => {
+  const handleCopyAppLink = async (targetApp: StoreApp) => {
     try {
-      await navigator.clipboard.writeText(buildPermanentLink(appId));
-      setCopiedAppId(appId);
+      await navigator.clipboard.writeText(buildPermanentAppShareUrl(targetApp));
+      setCopiedAppId(targetApp.id);
       window.setTimeout(() => {
-        setCopiedAppId((prev) => (prev === appId ? null : prev));
+        setCopiedAppId((prev) => (prev === targetApp.id ? null : prev));
       }, 2500);
     } catch {
       setCopiedAppId(null);
@@ -413,12 +413,31 @@ export function UploadStudioView({
     setUploading(true);
     setUploadProgress(0);
 
-    const finalizeSave = (savedApp: StoreApp) => {
+    const finalizeSave = async (savedApp: StoreApp, fromServer: boolean) => {
+      let syncedToCloud = fromServer || Boolean(savedApp.syncedToCloud);
+
+      if (user.provider === 'google' && auth.currentUser?.emailVerified) {
+        try {
+          const cloudOk = await cloudPublishOrUpdateApp(savedApp, isUpdate);
+          if (cloudOk) {
+            syncedToCloud = true;
+            await localMarkAppSynced(savedApp.id, true);
+          }
+        } catch {
+          // Keep saved locally / server-side and rely on snapshot URL if needed
+        }
+      }
+
+      const finalApp: StoreApp = {
+        ...savedApp,
+        syncedToCloud,
+      };
+
       setUploadProgress(100);
       setUploading(false);
-      setLastSavedBanner({ app: savedApp, isUpdate });
+      setLastSavedBanner({ app: finalApp, isUpdate });
       resetFormFields();
-      onAppSaved(savedApp, isUpdate);
+      onAppSaved(finalApp, isUpdate);
       window.scrollTo({ top: 0, behavior: 'smooth' });
     };
 
@@ -476,7 +495,7 @@ export function UploadStudioView({
               permissionsCount: extracted?.permissionsCount || 0,
               owner: user,
             });
-        finalizeSave(savedApp);
+        await finalizeSave(savedApp, false);
       } catch (localErr) {
         setUploading(false);
         setError(
@@ -509,7 +528,7 @@ export function UploadStudioView({
       if (xhr.status >= 200 && xhr.status < 300 && contentType.includes('application/json')) {
         try {
           const parsed = JSON.parse(xhr.responseText) as { app: StoreApp };
-          finalizeSave(parsed.app);
+          void finalizeSave(parsed.app, true);
         } catch {
           setUploading(false);
           setError('تم الرفع ولكن تعذر قراءة استجابة الخادم.');
@@ -802,13 +821,13 @@ export function UploadStudioView({
             <div className="flex items-center gap-2 min-w-0">
               <Link2 className="w-4 h-4 text-[#01875F] shrink-0" />
               <code className="text-xs font-mono text-[#202124] truncate" dir="ltr">
-                {buildPermanentLink(lastSavedBanner.app.id)}
+                {buildPermanentAppShareUrl(lastSavedBanner.app)}
               </code>
             </div>
             <div className="flex items-center gap-2 shrink-0">
               <button
                 type="button"
-                onClick={() => void handleCopyAppLink(lastSavedBanner.app.id)}
+                onClick={() => void handleCopyAppLink(lastSavedBanner.app)}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#01875F] bg-[#E6F4EA] hover:bg-[#D5ECD9] rounded-lg transition-colors"
               >
                 <Copy className="w-3.5 h-3.5" />
@@ -824,6 +843,12 @@ export function UploadStudioView({
               </button>
             </div>
           </div>
+
+          {!lastSavedBanner.app.syncedToCloud && (
+            <p className="text-[11px] text-[#016E4D] leading-relaxed">
+              هذا الرابط يحتوي تلقائياً على بيانات التطبيق لكي يفتح صفحة تطبيقك لدى أي شخص ترسل له الرابط. وللربط السحابي الكامل برابط قصير وإتاحة التطبيق في الواجهة العامة للجميع، يمكنك تسجيل الدخول بحساب جوجل.
+            </p>
+          )}
         </section>
       )}
 
@@ -850,7 +875,7 @@ export function UploadStudioView({
         ) : (
           <div className="divide-y divide-[#E8EAED]">
             {myApps.map((item) => {
-              const appLink = buildPermanentLink(item.id);
+              const appLink = buildPermanentAppShareUrl(item);
               const isEditingThis = editingApp?.id === item.id;
               return (
                 <div
@@ -872,6 +897,15 @@ export function UploadStudioView({
                         <span className="text-[11px] text-[#5F6368] tabular-nums">
                           {item.downloads} تثبيت
                         </span>
+                        <span
+                          className={`text-[10px] font-semibold px-2 py-0.5 rounded-md ${
+                            item.syncedToCloud
+                              ? 'bg-[#E6F4EA] text-[#01875F]'
+                              : 'bg-amber-50 text-amber-700'
+                          }`}
+                        >
+                          {item.syncedToCloud ? 'متزامن سحابياً' : 'رابط ذاتي مضمّن'}
+                        </span>
                       </div>
                       <div className="flex items-center gap-1.5 text-xs text-[#5F6368] min-w-0">
                         <Link2 className="w-3.5 h-3.5 text-[#01875F] shrink-0" />
@@ -885,7 +919,7 @@ export function UploadStudioView({
                   <div className="flex flex-wrap items-center gap-2 shrink-0">
                     <button
                       type="button"
-                      onClick={() => void handleCopyAppLink(item.id)}
+                      onClick={() => void handleCopyAppLink(item)}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-[#202124] bg-[#F8F9FA] hover:bg-[#F1F3F4] border border-[#DADCE0] rounded-lg transition-colors"
                     >
                       <Copy className="w-3.5 h-3.5 text-[#01875F]" />

@@ -21,9 +21,11 @@ import {
 } from 'lucide-react';
 import type { DeveloperSessionUser, ReviewItem, StoreApp } from '../types.ts';
 import { resolveAssetUrl } from '../catalog/fallbackStore.ts';
+import { auth, cloudDeleteApp, cloudSubmitReview } from '../firebase.ts';
 import {
   localBuildOrFetchApkBlob,
   localDeleteApp,
+  localHasStoredApkBlob,
   localIncrementInstall,
   localSubmitReview,
   localVerifyApkBlob,
@@ -36,6 +38,7 @@ import {
   recordAppDownload,
 } from '../utils/installHistory.ts';
 import type { DownloadedAppRecord } from '../utils/installHistory.ts';
+import { buildPermanentAppShareUrl } from '../utils/shareLink.ts';
 import { AppIcon } from './AppIcon.tsx';
 import { StarRating } from './StarRating.tsx';
 
@@ -108,7 +111,7 @@ export function AppDetailView({
   const [reviewSuccess, setReviewSuccess] = useState(false);
   const [helpfulVoted, setHelpfulVoted] = useState<Record<string, boolean>>({});
 
-  const permanentAppUrl = `${window.location.origin}${window.location.pathname}?app=${encodeURIComponent(app.id)}`;
+  const permanentAppUrl = buildPermanentAppShareUrl(app);
 
   useEffect(() => {
     const refreshHistory = () => setDownloadHistory(getDownloadedAppsMap());
@@ -135,7 +138,7 @@ export function AppDetailView({
     if (!showQrPanel) return;
     let cancelled = false;
     (async () => {
-      let qrTarget = `${window.location.origin}${window.location.pathname}?app=${encodeURIComponent(app.id)}`;
+      let qrTarget = permanentAppUrl;
       try {
         const res = await fetch('./api/health');
         const ct = res.headers.get('content-type') || '';
@@ -161,7 +164,7 @@ export function AppDetailView({
     return () => {
       cancelled = true;
     };
-  }, [showQrPanel, app.id]);
+  }, [showQrPanel, app.id, permanentAppUrl]);
 
   const handleDirectInstall = async () => {
     if (installPhase === 'verifying') return;
@@ -218,13 +221,25 @@ export function AppDetailView({
     }
 
     if (!backendOnline) {
+      const hasLocalBlob = await localHasStoredApkBlob(app.id);
+      const safeExternal =
+        app.externalApkUrl && /^https:\/\/[^\s@]+$/.test(app.externalApkUrl)
+          ? app.externalApkUrl
+          : null;
+      if (app.hasCustomApk && !safeExternal && !hasLocalBlob) {
+        setInstallPhase('error');
+        setInstallError(
+          'تعذر العثور على حزمة APK على الخادم؛ هذا التطبيق منشور من جهاز آخر على الاستضافة الثابتة دون رابط HTTPS مباشر. يرجى من المطور إضافة رابط تنزيل APK مباشر (HTTPS) أو النشر عبر خادم Play55 الكامل.'
+        );
+        return;
+      }
       const localCheck = await localVerifyApkBlob(app);
       if (!localCheck.valid) {
         setInstallPhase('error');
         setInstallError('ملف APK تالف أو غير مكتمل، يرجى من المطور إعادة رفع حزمة صالحة.');
         return;
       }
-      resolvedExternalUrl = localCheck.externalApkUrl || null;
+      resolvedExternalUrl = localCheck.externalApkUrl || safeExternal || null;
       resolvedSha256 = localCheck.sha256 || app.apkSha256 || null;
       setApkCheckInfo({
         isBinaryManifest: localCheck.isBinaryManifest,
@@ -331,6 +346,29 @@ export function AppDetailView({
       return;
     }
 
+    const saveReviewFallback = async () => {
+      if (auth.currentUser?.emailVerified) {
+        const cloudSaved = await cloudSubmitReview({
+          app,
+          authorName: authorInput.trim(),
+          rating: ratingInput,
+          comment: commentInput.trim(),
+          existingReviews: reviews,
+        }).catch(() => null);
+        if (cloudSaved) {
+          onAppUpdated(cloudSaved.app, [cloudSaved.review, ...reviews]);
+          return;
+        }
+      }
+      const localSaved = await localSubmitReview({
+        app,
+        authorName: authorInput.trim(),
+        rating: ratingInput,
+        comment: commentInput.trim(),
+      });
+      onAppUpdated(localSaved.app, [localSaved.review, ...reviews]);
+    };
+
     setSubmittingReview(true);
     try {
       const res = await fetch(`./api/apps/${encodeURIComponent(app.id)}/reviews`, {
@@ -345,13 +383,7 @@ export function AppDetailView({
 
       const contentType = res.headers.get('content-type') || '';
       if (!contentType.includes('application/json') || res.status === 405) {
-        const localSaved = await localSubmitReview({
-          app,
-          authorName: authorInput.trim(),
-          rating: ratingInput,
-          comment: commentInput.trim(),
-        });
-        onAppUpdated(localSaved.app, [localSaved.review, ...reviews]);
+        await saveReviewFallback();
         setAuthorInput('');
         setCommentInput('');
         setRatingInput(5);
@@ -377,13 +409,7 @@ export function AppDetailView({
       setReviewSuccess(true);
     } catch {
       try {
-        const localSaved = await localSubmitReview({
-          app,
-          authorName: authorInput.trim(),
-          rating: ratingInput,
-          comment: commentInput.trim(),
-        });
-        onAppUpdated(localSaved.app, [localSaved.review, ...reviews]);
+        await saveReviewFallback();
         setAuthorInput('');
         setCommentInput('');
         setRatingInput(5);
@@ -428,6 +454,7 @@ export function AppDetailView({
 
   const handleDeleteApp = async () => {
     if (!currentUser) return;
+    let deletedAnywhere = false;
     try {
       const token = await getAuthToken();
       const headers: Record<string, string> = {
@@ -443,16 +470,16 @@ export function AppDetailView({
       });
       const contentType = res.headers.get('content-type') || '';
       if (res.ok && contentType.includes('application/json')) {
-        onAppDeleted(app.id);
-        return;
-      }
-      if (res.status === 404 || res.status === 405 || !contentType.includes('application/json')) {
-        const deleted = await localDeleteApp(app.id, currentUser.uid);
-        if (deleted) onAppDeleted(app.id);
+        deletedAnywhere = true;
       }
     } catch {
-      const deleted = await localDeleteApp(app.id, currentUser.uid).catch(() => false);
-      if (deleted) onAppDeleted(app.id);
+      // Backend unavailable
+    }
+
+    const deletedCloud = await cloudDeleteApp(app.id).catch(() => false);
+    const deletedLocal = await localDeleteApp(app.id, currentUser.uid).catch(() => false);
+    if (deletedAnywhere || deletedCloud || deletedLocal) {
+      onAppDeleted(app.id);
     }
   };
 

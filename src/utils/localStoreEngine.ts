@@ -809,6 +809,28 @@ export async function localVoteHelpful(
   return nextCount;
 }
 
+export async function localHasStoredApkBlob(appId: string): Promise<boolean> {
+  try {
+    const db = await openLocalDb();
+    const saved = await idbGet<{ appId: string; blob: Blob }>(db, 'apkBlobs', appId);
+    return Boolean(saved?.blob);
+  } catch {
+    return false;
+  }
+}
+
+export async function localMarkAppSynced(appId: string, syncedToCloud = true): Promise<void> {
+  try {
+    const db = await openLocalDb();
+    const existing = await idbGet<StoreApp>(db, 'apps', appId);
+    if (existing) {
+      await idbPut(db, 'apps', { ...existing, syncedToCloud });
+    }
+  } catch {
+    // Ignore local flag update failure
+  }
+}
+
 export async function localDeleteApp(appId: string, ownerUid: string): Promise<boolean> {
   const db = await openLocalDb();
   const app = await idbGet<StoreApp>(db, 'apps', appId);
