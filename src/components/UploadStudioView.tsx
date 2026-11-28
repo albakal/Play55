@@ -77,6 +77,15 @@ interface PromoPreview {
   url: string;
 }
 
+function fileToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error || new Error('Failed reading image'));
+    reader.readAsDataURL(blob);
+  });
+}
+
 export function UploadStudioView({
   user,
   apps,
@@ -418,7 +427,34 @@ export function UploadStudioView({
 
       if (user.provider === 'google' && auth.currentUser?.emailVerified) {
         try {
-          const cloudOk = await cloudPublishOrUpdateApp(savedApp, isUpdate);
+          let cloudIconUrl = savedApp.iconUrl;
+          if (customIconFile) {
+            cloudIconUrl = await fileToDataUrl(customIconFile).catch(() => savedApp.iconUrl);
+          } else if (extracted?.iconDataUrl) {
+            cloudIconUrl = extracted.iconDataUrl;
+          } else if (extracted?.iconBlob) {
+            cloudIconUrl = await fileToDataUrl(extracted.iconBlob).catch(() => savedApp.iconUrl);
+          }
+
+          let cloudScreenshots = savedApp.screenshots;
+          if (screenshots.length > 0) {
+            const convertedShots: string[] = [];
+            for (const item of screenshots.slice(0, 4)) {
+              const dataUrl = await fileToDataUrl(item.file).catch(() => '');
+              if (dataUrl) convertedShots.push(dataUrl);
+            }
+            if (convertedShots.length > 0) {
+              cloudScreenshots = convertedShots;
+            }
+          }
+
+          const cloudCandidate: StoreApp = {
+            ...savedApp,
+            iconUrl: cloudIconUrl,
+            screenshots: cloudScreenshots,
+          };
+
+          const cloudOk = await cloudPublishOrUpdateApp(cloudCandidate, isUpdate);
           if (cloudOk) {
             syncedToCloud = true;
             await localMarkAppSynced(savedApp.id, true);

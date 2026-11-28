@@ -26,18 +26,63 @@ const ICON_LENS = svgDataUri(
 
 const ASSET_MAP: Record<string, string> = {
   '/src/assets/images/hero_banner_store_1795812501251.jpg': heroBannerImg,
+  './src/assets/images/hero_banner_store_1795812501251.jpg': heroBannerImg,
+  '/media/store/hero_banner_store_1795812501251.jpg': heroBannerImg,
+  './media/store/hero_banner_store_1795812501251.jpg': heroBannerImg,
   '/src/assets/images/app_icon_atlas_1795812501468.jpg': iconAtlasImg,
+  './src/assets/images/app_icon_atlas_1795812501468.jpg': iconAtlasImg,
+  '/media/store/app_icon_atlas_1795812501468.jpg': iconAtlasImg,
+  './media/store/app_icon_atlas_1795812501468.jpg': iconAtlasImg,
   '/src/assets/images/app_icon_qalam_1795812502461.jpg': iconQalamImg,
+  './src/assets/images/app_icon_qalam_1795812502461.jpg': iconQalamImg,
+  '/media/store/app_icon_qalam_1795812502461.jpg': iconQalamImg,
+  './media/store/app_icon_qalam_1795812502461.jpg': iconQalamImg,
   '/src/assets/images/app_icon_sada_1795812502435.jpg': iconSadaImg,
+  './src/assets/images/app_icon_sada_1795812502435.jpg': iconSadaImg,
+  '/media/store/app_icon_sada_1795812502435.jpg': iconSadaImg,
+  './media/store/app_icon_sada_1795812502435.jpg': iconSadaImg,
   '/src/assets/images/promo_screen_productivity_1795812503448.jpg': promoProductivityImg,
+  './src/assets/images/promo_screen_productivity_1795812503448.jpg': promoProductivityImg,
+  '/media/store/promo_screen_productivity_1795812503448.jpg': promoProductivityImg,
+  './media/store/promo_screen_productivity_1795812503448.jpg': promoProductivityImg,
   '/src/assets/images/promo_screen_audio_1795812504131.jpg': promoAudioImg,
+  './src/assets/images/promo_screen_audio_1795812504131.jpg': promoAudioImg,
+  '/media/store/promo_screen_audio_1795812504131.jpg': promoAudioImg,
+  './media/store/promo_screen_audio_1795812504131.jpg': promoAudioImg,
   '/api/brand-icon/nabd': ICON_NABD,
+  './api/brand-icon/nabd': ICON_NABD,
   '/api/brand-icon/bayan': ICON_BAYAN,
+  './api/brand-icon/bayan': ICON_BAYAN,
   '/api/brand-icon/lens': ICON_LENS,
+  './api/brand-icon/lens': ICON_LENS,
 };
 
 export function resolveAssetUrl(url: string): string {
-  return ASSET_MAP[url] || url;
+  if (!url || typeof url !== 'string') return '';
+  const trimmed = url.trim();
+  if (!trimmed) return '';
+  if (ASSET_MAP[trimmed]) return ASSET_MAP[trimmed];
+
+  if (/^(data:|blob:|https?:\/\/)/i.test(trimmed)) {
+    return trimmed;
+  }
+
+  const normalized = trimmed.replace(/^\/Play55(?=\/)/i, '');
+  if (ASSET_MAP[normalized]) return ASSET_MAP[normalized];
+
+  if (normalized.startsWith('/uploads/')) {
+    return `.${normalized}`;
+  }
+  if (normalized.startsWith('uploads/')) {
+    return `./${normalized}`;
+  }
+  if (normalized.startsWith('/media/')) {
+    return `.${normalized}`;
+  }
+  if (normalized.startsWith('media/')) {
+    return `./${normalized}`;
+  }
+  return normalized;
 }
 
 export const FALLBACK_APPS: StoreApp[] = [

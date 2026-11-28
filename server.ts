@@ -384,10 +384,10 @@ function buildInitialSeed(): StoreDatabase {
       minAndroid: 'Android 8.0+',
       ageRating: '+3',
       sizeMB: 18.6,
-      iconUrl: '/src/assets/images/app_icon_atlas_1795812501468.jpg',
+      iconUrl: './media/store/app_icon_atlas_1795812501468.jpg',
       screenshots: [
-        '/src/assets/images/promo_screen_productivity_1795812503448.jpg',
-        '/src/assets/images/hero_banner_store_1795812501251.jpg',
+        './media/store/promo_screen_productivity_1795812503448.jpg',
+        './media/store/hero_banner_store_1795812501251.jpg',
       ],
       apkFilename: '',
       hasCustomApk: false,
@@ -415,9 +415,9 @@ function buildInitialSeed(): StoreDatabase {
       minAndroid: 'Android 9.0+',
       ageRating: '+3',
       sizeMB: 24.3,
-      iconUrl: '/src/assets/images/app_icon_qalam_1795812502461.jpg',
+      iconUrl: './media/store/app_icon_qalam_1795812502461.jpg',
       screenshots: [
-        '/src/assets/images/promo_screen_productivity_1795812503448.jpg',
+        './media/store/promo_screen_productivity_1795812503448.jpg',
       ],
       apkFilename: '',
       hasCustomApk: false,
@@ -445,9 +445,9 @@ function buildInitialSeed(): StoreDatabase {
       minAndroid: 'Android 8.0+',
       ageRating: '+12',
       sizeMB: 31.2,
-      iconUrl: '/src/assets/images/app_icon_sada_1795812502435.jpg',
+      iconUrl: './media/store/app_icon_sada_1795812502435.jpg',
       screenshots: [
-        '/src/assets/images/promo_screen_audio_1795812504131.jpg',
+        './media/store/promo_screen_audio_1795812504131.jpg',
       ],
       apkFilename: '',
       hasCustomApk: false,
@@ -475,9 +475,9 @@ function buildInitialSeed(): StoreDatabase {
       minAndroid: 'Android 8.0+',
       ageRating: '+3',
       sizeMB: 14.8,
-      iconUrl: '/api/brand-icon/nabd',
+      iconUrl: './api/brand-icon/nabd',
       screenshots: [
-        '/src/assets/images/promo_screen_productivity_1795812503448.jpg',
+        './media/store/promo_screen_productivity_1795812503448.jpg',
       ],
       apkFilename: '',
       hasCustomApk: false,
@@ -505,9 +505,9 @@ function buildInitialSeed(): StoreDatabase {
       minAndroid: 'Android 7.0+',
       ageRating: '+3',
       sizeMB: 22.0,
-      iconUrl: '/api/brand-icon/bayan',
+      iconUrl: './api/brand-icon/bayan',
       screenshots: [
-        '/src/assets/images/hero_banner_store_1795812501251.jpg',
+        './media/store/hero_banner_store_1795812501251.jpg',
       ],
       apkFilename: '',
       hasCustomApk: false,
@@ -535,9 +535,9 @@ function buildInitialSeed(): StoreDatabase {
       minAndroid: 'Android 10+',
       ageRating: '+3',
       sizeMB: 36.4,
-      iconUrl: '/api/brand-icon/lens',
+      iconUrl: './api/brand-icon/lens',
       screenshots: [
-        '/src/assets/images/hero_banner_store_1795812501251.jpg',
+        './media/store/hero_banner_store_1795812501251.jpg',
       ],
       apkFilename: '',
       hasCustomApk: false,
@@ -837,8 +837,9 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '5mb' }));
 
-  // Static uploaded media
-  app.use('/uploads', express.static(UPLOADS_DIR));
+  // Static uploaded media & persistent store assets
+  app.use('/uploads', express.static(UPLOADS_DIR, { maxAge: '7d' }));
+  app.use('/media', express.static(path.join(ROOT_DIR, 'public/media'), { maxAge: '7d' }));
 
   // Health check for full-stack runtime detection
   app.get('/api/health', (_req, res) => {
@@ -1114,10 +1115,10 @@ async function startServer() {
         }
 
         const iconFile = files?.icon?.[0];
-        let iconUrl = '/api/brand-icon/nabd';
+        let iconUrl = './api/brand-icon/nabd';
 
         if (iconFile) {
-          iconUrl = `/uploads/icons/${iconFile.filename}`;
+          iconUrl = `./uploads/icons/${iconFile.filename}`;
         } else {
           // Server-side fallback: attempt to extract icon directly from uploaded APK
           try {
@@ -1136,7 +1137,7 @@ async function startServer() {
               const ext = path.extname(chosen.name).toLowerCase() || '.png';
               const iconName = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`;
               await fs.promises.writeFile(path.join(ICONS_DIR, iconName), buf);
-              iconUrl = `/uploads/icons/${iconName}`;
+              iconUrl = `./uploads/icons/${iconName}`;
             }
           } catch {
             // Keep default SVG icon fallback
@@ -1144,7 +1145,7 @@ async function startServer() {
         }
 
         const screenshotFiles = files?.screenshots || [];
-        const screenshots = screenshotFiles.map((f) => `/uploads/screenshots/${f.filename}`);
+        const screenshots = screenshotFiles.map((f) => `./uploads/screenshots/${f.filename}`);
 
         const sizeMB = Number(body.sizeMB) || Number((finalSizeBytes / (1024 * 1024)).toFixed(2)) || 0.1;
         const now = new Date().toISOString();
@@ -1301,13 +1302,13 @@ async function startServer() {
         const iconFile = files?.icon?.[0];
         let nextIconUrl = target.iconUrl;
         if (iconFile) {
-          nextIconUrl = `/uploads/icons/${iconFile.filename}`;
+          nextIconUrl = `./uploads/icons/${iconFile.filename}`;
         }
 
         const screenshotFiles = files?.screenshots || [];
         const nextScreenshots =
           screenshotFiles.length > 0
-            ? screenshotFiles.map((f) => `/uploads/screenshots/${f.filename}`)
+            ? screenshotFiles.map((f) => `./uploads/screenshots/${f.filename}`)
             : target.screenshots;
 
         const nextExternalUrl =
@@ -1546,6 +1547,11 @@ async function startServer() {
     }
     await saveStore(db);
     res.json({ deleted: true });
+  });
+
+  // Return proper 404 for missing static media or API paths rather than falling through to index.html
+  app.use(['/uploads', '/media', '/api'], (_req, res) => {
+    res.status(404).json({ error: 'Not found' });
   });
 
   // Mount Vite dev middleware or production dist

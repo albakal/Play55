@@ -21,6 +21,7 @@ import {
   cloudGetAppDetail,
   cloudListApps,
   cloudPublishOrUpdateApp,
+  needsCloudMediaRepair,
   signInWithGoogle,
   signOutDeveloper,
   syncDeveloperProfile,
@@ -404,7 +405,7 @@ export default function App() {
     const candidates = apps.filter(
       (a) =>
         a.ownerUid === currentUser.uid &&
-        !a.syncedToCloud &&
+        (!a.syncedToCloud || needsCloudMediaRepair(a)) &&
         !FALLBACK_APP_IDS.has(a.id) &&
         !autoSyncedIdsRef.current.has(a.id)
     );
@@ -415,7 +416,7 @@ export default function App() {
       for (const item of candidates) {
         autoSyncedIdsRef.current.add(item.id);
         try {
-          const synced = await cloudPublishOrUpdateApp(item, false);
+          const synced = await cloudPublishOrUpdateApp(item, Boolean(item.syncedToCloud));
           if (synced && !cancelled) {
             await localMarkAppSynced(item.id, true);
             setApps((prev) =>

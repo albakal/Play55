@@ -234,25 +234,54 @@ function computeStatsFromReviews(reviews: ReviewItem[]) {
   };
 }
 
-export async function compressImageDataUrlForCloud(
-  url: string,
-  maxChars = 110_000,
-  maxDim = 256
+function isUnportableMediaRef(url: string): boolean {
+  if (!url || typeof url !== 'string') return false;
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  return (
+    trimmed.startsWith('/uploads/') ||
+    trimmed.startsWith('./uploads/') ||
+    trimmed.startsWith('uploads/') ||
+    trimmed.startsWith('/src/assets/') ||
+    trimmed.startsWith('./src/assets/') ||
+    trimmed.startsWith('blob:') ||
+    trimmed.startsWith('http://')
+  );
+}
+
+export function needsCloudMediaRepair(appData: StoreApp): boolean {
+  if (isUnportableMediaRef(appData.iconUrl)) return true;
+  return (appData.screenshots || []).some((s) => isUnportableMediaRef(s));
+}
+
+function normalizeStaticStoreMediaRef(url: string): string | null {
+  const trimmed = url.trim().replace(/^\/Play55(?=\/)/i, '');
+  const brandMatch = /^\.?\/?api\/brand-icon\/([a-z0-9_-]+)$/i.exec(trimmed);
+  if (brandMatch?.[1]) {
+    return `./api/brand-icon/${brandMatch[1].toLowerCase()}`;
+  }
+  const storeMatch =
+    /^\.?\/?(?:src\/assets\/images|media\/store)\/([a-zA-Z0-9._-]+\.(?:jpg|jpeg|png|webp))$/i.exec(
+      trimmed
+    );
+  if (storeMatch?.[1]) {
+    return `./media/store/${storeMatch[1]}`;
+  }
+  return null;
+}
+
+async function renderImageSourceToCompressedDataUrl(
+  src: string,
+  maxChars: number,
+  maxDim: number
 ): Promise<string> {
-  if (!url || typeof url !== 'string') return '';
-  if (!url.startsWith('data:')) {
-    return url.length <= 120_000 ? url : '';
-  }
-  if (url.length <= maxChars) return url;
-  if (!url.startsWith('data:image/') || url.startsWith('data:image/svg+xml')) {
-    return '';
-  }
   if (typeof document === 'undefined' || typeof Image === 'undefined') {
     return '';
   }
 
   return await new Promise<string>((resolve) => {
     const img = new Image();
+    img.crossOrigin = 'anonymous';
     img.onload = () => {
       try {
         const ratio = Math.min(1, maxDim / Math.max(img.width || 1, img.height || 1));
@@ -267,20 +296,84 @@ export async function compressImageDataUrlForCloud(
           return;
         }
         ctx.drawImage(img, 0, 0, width, height);
-        const webp = canvas.toDataURL('image/webp', 0.8);
-        if (webp.length <= maxChars) {
-          resolve(webp);
-          return;
+
+        const attempts: Array<[string, number]> = [
+          ['image/webp', 0.82],
+          ['image/webp', 0.68],
+          ['image/webp', 0.52],
+          ['image/jpeg', 0.75],
+          ['image/jpeg', 0.58],
+          ['image/jpeg', 0.42],
+        ];
+        for (const [mime, quality] of attempts) {
+          const out = canvas.toDataURL(mime, quality);
+          if (out.startsWith(`data:${mime}`) && out.length <= maxChars) {
+            resolve(out);
+            return;
+          }
         }
-        const jpg = canvas.toDataURL('image/jpeg', 0.72);
-        resolve(jpg.length <= maxChars ? jpg : '');
+        resolve('');
       } catch {
         resolve('');
       }
     };
     img.onerror = () => resolve('');
-    img.src = url;
+    img.src = src;
   });
+}
+
+export async function compressImageDataUrlForCloud(
+  url: string,
+  maxChars = 110_000,
+  maxDim = 256
+): Promise<string> {
+  if (!url || typeof url !== 'string') return '';
+  const trimmed = url.trim();
+  if (!trimmed) return '';
+
+  const staticRef = normalizeStaticStoreMediaRef(trimmed);
+  if (staticRef) return staticRef;
+
+  if (trimmed.startsWith('data:image/svg+xml')) {
+    return trimmed.length <= maxChars ? trimmed : '';
+  }
+
+  if (trimmed.startsWith('data:image/')) {
+    if (trimmed.length <= maxChars) return trimmed;
+    return await renderImageSourceToCompressedDataUrl(trimmed, maxChars, maxDim);
+  }
+
+  if (trimmed.startsWith('https://')) {
+    return trimmed.length <= 500 ? trimmed : '';
+  }
+
+  // Relative upload path (./uploads/..., /uploads/...) or blob: URL -> fetch & convert to portable data URL
+  const fetchTarget = trimmed.startsWith('/uploads/')
+    ? `.${trimmed}`
+    : trimmed.startsWith('uploads/')
+    ? `./${trimmed}`
+    : trimmed;
+
+  if (typeof fetch !== 'function' || typeof URL === 'undefined') {
+    return '';
+  }
+
+  try {
+    const res = await fetch(fetchTarget);
+    const ct = res.headers.get('content-type') || '';
+    if (!res.ok || !ct.startsWith('image/')) {
+      return '';
+    }
+    const blob = await res.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      return await renderImageSourceToCompressedDataUrl(objectUrl, maxChars, maxDim);
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
+  } catch {
+    return '';
+  }
 }
 
 export async function cloudListApps(): Promise<StoreApp[]> {

@@ -96,11 +96,23 @@ function sanitizeHttpsUrl(raw?: string): string | undefined {
 
 function sanitizeImageRefForHash(url: string, maxDataLen: number): string {
   if (!url || typeof url !== 'string') return '';
-  if (url.startsWith('data:')) {
-    return url.length <= maxDataLen ? url : '';
+  const trimmed = url.trim().replace(/^\/Play55(?=\/)/i, '');
+  if (trimmed.startsWith('data:')) {
+    return trimmed.length <= maxDataLen ? trimmed : '';
   }
-  if (url.startsWith('https://') || url.startsWith('/') || url.startsWith('./')) {
-    return url.length <= 500 ? url : '';
+  const storeMatch =
+    /^\.?\/?(?:src\/assets\/images|media\/store)\/([a-zA-Z0-9._-]+\.(?:jpg|jpeg|png|webp))$/i.exec(
+      trimmed
+    );
+  if (storeMatch?.[1]) {
+    return `./media/store/${storeMatch[1]}`;
+  }
+  const brandMatch = /^\.?\/?api\/brand-icon\/([a-z0-9_-]+)$/i.exec(trimmed);
+  if (brandMatch?.[1]) {
+    return `./api/brand-icon/${brandMatch[1].toLowerCase()}`;
+  }
+  if (trimmed.startsWith('https://')) {
+    return trimmed.length <= 500 ? trimmed : '';
   }
   return '';
 }
@@ -167,9 +179,9 @@ export function buildPermanentAppShareUrl(
     ma: app.minAndroid.slice(0, 40),
     ar: app.ageRating.slice(0, 16),
     sz: Number(app.sizeMB.toFixed(2)),
-    ic: sanitizeImageRefForHash(app.iconUrl, 3600) || undefined,
+    ic: sanitizeImageRefForHash(app.iconUrl, 10_000) || undefined,
     sc: (app.screenshots || [])
-      .map((s) => sanitizeImageRefForHash(s, 1200))
+      .map((s) => sanitizeImageRefForHash(s, 2000))
       .filter(Boolean)
       .slice(0, 4),
     fn: (app.apkFilename || '').slice(0, 180) || undefined,

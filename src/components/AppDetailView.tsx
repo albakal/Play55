@@ -100,6 +100,7 @@ export function AppDetailView({
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const [copiedShare, setCopiedShare] = useState(false);
   const [lightboxImage, setLightboxImage] = useState<string | null>(null);
+  const [brokenShots, setBrokenShots] = useState<Record<number, boolean>>({});
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   // Review form state
@@ -129,6 +130,7 @@ export function AppDetailView({
     setInstallError(null);
     setApkCheckInfo(null);
     setShowQrPanel(false);
+    setBrokenShots({});
     setConfirmDelete(false);
     setReviewError(null);
     setReviewSuccess(false);
@@ -812,6 +814,7 @@ export function AppDetailView({
           <div className="flex gap-4 overflow-x-auto pb-2 no-scrollbar">
             {app.screenshots.map((shot, idx) => {
               const resolvedShot = resolveAssetUrl(shot);
+              if (!resolvedShot || brokenShots[idx]) return null;
               return (
                 <button
                   key={`${shot}-${idx}`}
@@ -823,6 +826,7 @@ export function AppDetailView({
                     src={resolvedShot}
                     alt={`صورة ترويجية ${idx + 1} لتطبيق ${app.name}`}
                     referrerPolicy="no-referrer"
+                    onError={() => setBrokenShots((prev) => ({ ...prev, [idx]: true }))}
                     className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-200"
                   />
                 </button>
