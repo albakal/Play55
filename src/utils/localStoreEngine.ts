@@ -257,6 +257,58 @@ function blobToDataUrl(blob: Blob): Promise<string> {
   });
 }
 
+async function compressLocalImageBlob(
+  blob: Blob,
+  maxDim: number,
+  maxChars: number
+): Promise<string> {
+  if (typeof document !== 'undefined' && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      const compressed = await new Promise<string>((resolve) => {
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const natW = img.naturalWidth || img.width || maxDim;
+            const natH = img.naturalHeight || img.height || maxDim;
+            for (const factor of [1, 0.7, 0.45]) {
+              const target = Math.max(64, Math.round(maxDim * factor));
+              const ratio = Math.min(1, target / Math.max(natW, natH, 1));
+              const canvas = document.createElement('canvas');
+              canvas.width = Math.max(1, Math.round(natW * ratio));
+              canvas.height = Math.max(1, Math.round(natH * ratio));
+              const ctx = canvas.getContext('2d');
+              if (!ctx) break;
+              ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+              for (const [mime, q] of [
+                ['image/webp', 0.84],
+                ['image/webp', 0.65],
+                ['image/jpeg', 0.78],
+                ['image/jpeg', 0.55],
+              ] as const) {
+                const out = canvas.toDataURL(mime, q);
+                if (out.startsWith(`data:${mime}`) && out.length <= maxChars) {
+                  resolve(out);
+                  return;
+                }
+              }
+            }
+            resolve('');
+          } catch {
+            resolve('');
+          }
+        };
+        img.onerror = () => resolve('');
+        img.src = objectUrl;
+      });
+      if (compressed) return compressed;
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
+  }
+  return await blobToDataUrl(blob);
+}
+
 export async function localRegisterDeveloper(params: {
   name: string;
   email: string;
@@ -505,14 +557,15 @@ export async function localPublishApp(params: {
   const db = await openLocalDb();
   const appId = randomId('app');
 
-  let iconUrl = FALLBACK_APPS[0].iconUrl;
+  let iconUrl = './media/store/brand_nabd.svg';
   if (params.iconSource) {
-    iconUrl = await blobToDataUrl(params.iconSource);
+    iconUrl = await compressLocalImageBlob(params.iconSource, 256, 95_000);
   }
 
   const screenshotUrls: string[] = [];
   for (const file of params.screenshots.slice(0, 8)) {
-    screenshotUrls.push(await blobToDataUrl(file));
+    const url = await compressLocalImageBlob(file, 900, 120_000);
+    if (url) screenshotUrls.push(url);
   }
 
   const now = new Date().toISOString();
@@ -588,14 +641,15 @@ export async function localUpdateApp(params: {
 
   let iconUrl = params.existingApp.iconUrl;
   if (params.iconSource) {
-    iconUrl = await blobToDataUrl(params.iconSource);
+    iconUrl = await compressLocalImageBlob(params.iconSource, 256, 95_000);
   }
 
   let screenshotUrls = params.existingApp.screenshots;
   if (params.screenshots.length > 0) {
     screenshotUrls = [];
     for (const file of params.screenshots.slice(0, 8)) {
-      screenshotUrls.push(await blobToDataUrl(file));
+      const url = await compressLocalImageBlob(file, 900, 120_000);
+      if (url) screenshotUrls.push(url);
     }
   }
 
@@ -819,12 +873,21 @@ export async function localHasStoredApkBlob(appId: string): Promise<boolean> {
   }
 }
 
-export async function localMarkAppSynced(appId: string, syncedToCloud = true): Promise<void> {
+export async function localMarkAppSynced(
+  appId: string,
+  syncedToCloud = true,
+  syncedPatch?: { iconUrl?: string; screenshots?: string[] }
+): Promise<void> {
   try {
     const db = await openLocalDb();
     const existing = await idbGet<StoreApp>(db, 'apps', appId);
     if (existing) {
-      await idbPut(db, 'apps', { ...existing, syncedToCloud });
+      await idbPut(db, 'apps', {
+        ...existing,
+        syncedToCloud,
+        ...(syncedPatch?.iconUrl ? { iconUrl: syncedPatch.iconUrl } : {}),
+        ...(syncedPatch?.screenshots ? { screenshots: syncedPatch.screenshots } : {}),
+      });
     }
   } catch {
     // Ignore local flag update failure

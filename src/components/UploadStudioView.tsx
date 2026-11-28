@@ -28,7 +28,12 @@ import type {
   StoreApp,
 } from '../types.ts';
 import { resolveAssetUrl } from '../catalog/fallbackStore.ts';
-import { auth, cloudPublishOrUpdateApp } from '../firebase.ts';
+import {
+  auth,
+  cloudPublishOrUpdateApp,
+  compressBlobToDataUrl,
+  compressImageDataUrlForCloud,
+} from '../firebase.ts';
 import { parseApkFile } from '../utils/apkParser.ts';
 import {
   buildSampleApkFileClient,
@@ -143,7 +148,9 @@ export function UploadStudioView({
   const [error, setError] = useState<string | null>(null);
   const [lastSavedBanner, setLastSavedBanner] = useState<{
     app: StoreApp;
+    shareUrl: string;
     isUpdate: boolean;
+    cloudSyncWarning?: string;
   } | null>(null);
   const [copiedAppId, setCopiedAppId] = useState<string | null>(null);
 
@@ -422,56 +429,111 @@ export function UploadStudioView({
     setUploading(true);
     setUploadProgress(0);
 
-    const finalizeSave = async (savedApp: StoreApp, fromServer: boolean) => {
-      let syncedToCloud = fromServer || Boolean(savedApp.syncedToCloud);
+    const finalizeSave = async (savedApp: StoreApp, _fromServer: boolean) => {
+      let workingApp: StoreApp = { ...savedApp };
+      let syncedToCloud = Boolean(savedApp.syncedToCloud);
+      let cloudSyncWarning: string | undefined;
 
-      if (user.provider === 'google' && auth.currentUser?.emailVerified) {
-        try {
-          let cloudIconUrl = savedApp.iconUrl;
-          if (customIconFile) {
-            cloudIconUrl = await fileToDataUrl(customIconFile).catch(() => savedApp.iconUrl);
-          } else if (extracted?.iconDataUrl) {
-            cloudIconUrl = extracted.iconDataUrl;
-          } else if (extracted?.iconBlob) {
-            cloudIconUrl = await fileToDataUrl(extracted.iconBlob).catch(() => savedApp.iconUrl);
-          }
+      // Always prefer direct compressed File/Blob sources over ephemeral ./uploads/... paths
+      let candidateIconUrl = savedApp.iconUrl;
+      if (customIconFile) {
+        candidateIconUrl =
+          (await compressBlobToDataUrl(customIconFile, 90_000, 256)) ||
+          (await fileToDataUrl(customIconFile).catch(() => savedApp.iconUrl));
+      } else if (extracted?.iconBlob) {
+        candidateIconUrl =
+          (await compressBlobToDataUrl(extracted.iconBlob, 90_000, 256)) ||
+          extracted.iconDataUrl ||
+          savedApp.iconUrl;
+      } else if (extracted?.iconDataUrl) {
+        candidateIconUrl =
+          (await compressImageDataUrlForCloud(extracted.iconDataUrl, 90_000, 256)) ||
+          extracted.iconDataUrl;
+      }
 
-          let cloudScreenshots = savedApp.screenshots;
-          if (screenshots.length > 0) {
-            const convertedShots: string[] = [];
-            for (const item of screenshots.slice(0, 4)) {
-              const dataUrl = await fileToDataUrl(item.file).catch(() => '');
-              if (dataUrl) convertedShots.push(dataUrl);
-            }
-            if (convertedShots.length > 0) {
-              cloudScreenshots = convertedShots;
-            }
-          }
-
-          const cloudCandidate: StoreApp = {
-            ...savedApp,
-            iconUrl: cloudIconUrl,
-            screenshots: cloudScreenshots,
-          };
-
-          const cloudOk = await cloudPublishOrUpdateApp(cloudCandidate, isUpdate);
-          if (cloudOk) {
-            syncedToCloud = true;
-            await localMarkAppSynced(savedApp.id, true);
-          }
-        } catch {
-          // Keep saved locally / server-side and rely on snapshot URL if needed
+      let candidateScreenshots = savedApp.screenshots;
+      if (screenshots.length > 0) {
+        const convertedShots: string[] = [];
+        for (const item of screenshots.slice(0, 4)) {
+          const compressed =
+            (await compressBlobToDataUrl(item.file, 100_000, 720)) ||
+            (await fileToDataUrl(item.file).catch(() => ''));
+          if (compressed) convertedShots.push(compressed);
+        }
+        if (convertedShots.length > 0) {
+          candidateScreenshots = convertedShots;
         }
       }
 
+      if (user.provider === 'google' && auth.currentUser?.emailVerified) {
+        try {
+          const cloudCandidate: StoreApp = {
+            ...savedApp,
+            iconUrl: candidateIconUrl,
+            screenshots: candidateScreenshots,
+          };
+
+          const cloudResult = await cloudPublishOrUpdateApp(
+            cloudCandidate,
+            isUpdate,
+            editingApp
+              ? { iconUrl: editingApp.iconUrl, screenshots: editingApp.screenshots }
+              : undefined
+          );
+          if (cloudResult.ok && cloudResult.syncedApp) {
+            syncedToCloud = true;
+            workingApp = cloudResult.syncedApp;
+            await localMarkAppSynced(savedApp.id, true, {
+              iconUrl: workingApp.iconUrl,
+              screenshots: workingApp.screenshots,
+            });
+          } else {
+            syncedToCloud = false;
+            cloudSyncWarning =
+              'تم حفظ التطبيق محلياً، لكن تعذر توثيق الجلسة السحابية لمزامنة الصور مع جميع الزوار.';
+          }
+        } catch (cloudErr) {
+          syncedToCloud = false;
+          cloudSyncWarning =
+            'تم حفظ التطبيق محلياً، لكن فشلت المزامنة السحابية للصور في Firestore. تأكد من الاتصال وحاول تحديث الإصدار مجدداً.';
+          console.error('Cloud publish failed:', cloudErr);
+        }
+      } else {
+        syncedToCloud = false;
+        workingApp = {
+          ...savedApp,
+          iconUrl:
+            (await compressImageDataUrlForCloud(candidateIconUrl, 90_000, 256)) ||
+            candidateIconUrl,
+          screenshots: candidateScreenshots,
+          syncedToCloud: false,
+        };
+      }
+
       const finalApp: StoreApp = {
-        ...savedApp,
+        ...workingApp,
         syncedToCloud,
       };
 
+      let shareUrl = buildPermanentAppShareUrl(finalApp);
+      if (!syncedToCloud) {
+        const compactIcon =
+          (await compressImageDataUrlForCloud(finalApp.iconUrl, 11_000, 128)) || '';
+        const compactShots: string[] = [];
+        for (const s of (finalApp.screenshots || []).slice(0, 2)) {
+          const cs = await compressImageDataUrlForCloud(s, 9_500, 360);
+          if (cs) compactShots.push(cs);
+        }
+        shareUrl = buildPermanentAppShareUrl({
+          ...finalApp,
+          iconUrl: compactIcon || finalApp.iconUrl,
+          screenshots: compactShots,
+        });
+      }
+
       setUploadProgress(100);
       setUploading(false);
-      setLastSavedBanner({ app: finalApp, isUpdate });
+      setLastSavedBanner({ app: finalApp, shareUrl, isUpdate, cloudSyncWarning });
       resetFormFields();
       onAppSaved(finalApp, isUpdate);
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -857,13 +919,23 @@ export function UploadStudioView({
             <div className="flex items-center gap-2 min-w-0">
               <Link2 className="w-4 h-4 text-[#01875F] shrink-0" />
               <code className="text-xs font-mono text-[#202124] truncate" dir="ltr">
-                {buildPermanentAppShareUrl(lastSavedBanner.app)}
+                {lastSavedBanner.shareUrl}
               </code>
             </div>
             <div className="flex items-center gap-2 shrink-0">
               <button
                 type="button"
-                onClick={() => void handleCopyAppLink(lastSavedBanner.app)}
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(lastSavedBanner.shareUrl);
+                    setCopiedAppId(lastSavedBanner.app.id);
+                    window.setTimeout(() => {
+                      setCopiedAppId((prev) => (prev === lastSavedBanner.app.id ? null : prev));
+                    }, 2500);
+                  } catch {
+                    setCopiedAppId(null);
+                  }
+                }}
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#01875F] bg-[#E6F4EA] hover:bg-[#D5ECD9] rounded-lg transition-colors"
               >
                 <Copy className="w-3.5 h-3.5" />
@@ -880,9 +952,15 @@ export function UploadStudioView({
             </div>
           </div>
 
-          {!lastSavedBanner.app.syncedToCloud && (
+          {lastSavedBanner.cloudSyncWarning && (
+            <p className="text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded-lg p-2.5 leading-relaxed">
+              {lastSavedBanner.cloudSyncWarning}
+            </p>
+          )}
+
+          {!lastSavedBanner.app.syncedToCloud && !lastSavedBanner.cloudSyncWarning && (
             <p className="text-[11px] text-[#016E4D] leading-relaxed">
-              هذا الرابط يحتوي تلقائياً على بيانات التطبيق لكي يفتح صفحة تطبيقك لدى أي شخص ترسل له الرابط. وللربط السحابي الكامل برابط قصير وإتاحة التطبيق في الواجهة العامة للجميع، يمكنك تسجيل الدخول بحساب جوجل.
+              هذا الرابط يحتوي تلقائياً على بيانات التطبيق وصوره لكي يفتح صفحة تطبيقك لدى أي شخص ترسل له الرابط. وللربط السحابي الكامل برابط قصير وإتاحة التطبيق في الواجهة العامة للجميع، يمكنك تسجيل الدخول بحساب جوجل.
             </p>
           )}
         </section>

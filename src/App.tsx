@@ -21,6 +21,7 @@ import {
   cloudGetAppDetail,
   cloudListApps,
   cloudPublishOrUpdateApp,
+  isPortableMediaRef,
   needsCloudMediaRepair,
   signInWithGoogle,
   signOutDeveloper,
@@ -339,14 +340,35 @@ export default function App() {
       } else {
         const existingTime = new Date(existing.updatedAt).getTime() || 0;
         const incomingTime = new Date(item.updatedAt).getTime() || 0;
-        if (incomingTime > existingTime) {
-          merged.set(item.id, {
-            ...item,
-            syncedToCloud: existing.syncedToCloud || item.syncedToCloud,
-          });
-        } else if (item.syncedToCloud && !existing.syncedToCloud) {
-          merged.set(item.id, { ...existing, syncedToCloud: true });
-        }
+        const newer = incomingTime > existingTime ? item : existing;
+        const older = incomingTime > existingTime ? existing : item;
+
+        const bestIconUrl = isPortableMediaRef(newer.iconUrl)
+          ? newer.iconUrl
+          : isPortableMediaRef(older.iconUrl)
+          ? older.iconUrl
+          : newer.iconUrl || older.iconUrl;
+
+        const newerHasPortableShots =
+          (newer.screenshots || []).length > 0 &&
+          (newer.screenshots || []).every((s) => isPortableMediaRef(s));
+        const olderHasPortableShots =
+          (older.screenshots || []).length > 0 &&
+          (older.screenshots || []).every((s) => isPortableMediaRef(s));
+        const bestScreenshots = newerHasPortableShots
+          ? newer.screenshots
+          : olderHasPortableShots
+          ? older.screenshots
+          : (newer.screenshots || []).length > 0
+          ? newer.screenshots
+          : older.screenshots;
+
+        merged.set(item.id, {
+          ...newer,
+          iconUrl: bestIconUrl,
+          screenshots: bestScreenshots,
+          syncedToCloud: Boolean(existing.syncedToCloud || item.syncedToCloud),
+        });
       }
     }
     return Array.from(merged.values());
@@ -367,8 +389,12 @@ export default function App() {
         throw new Error('Static fallback');
       }
       const data = (await res.json()) as { apps: StoreApp[] };
-      const backendApps = data.apps.map((a) => ({ ...a, syncedToCloud: true }));
       const cloudApps = await cloudPromise;
+      const cloudIds = new Set(cloudApps.map((c) => c.id));
+      const backendApps = data.apps.map((a) => ({
+        ...a,
+        syncedToCloud: FALLBACK_APP_IDS.has(a.id) || cloudIds.has(a.id) || Boolean(a.syncedToCloud),
+      }));
       setApps(sortCatalogApps(mergeAppLists(backendApps, cloudApps), sort));
     } catch {
       try {
@@ -416,11 +442,14 @@ export default function App() {
       for (const item of candidates) {
         autoSyncedIdsRef.current.add(item.id);
         try {
-          const synced = await cloudPublishOrUpdateApp(item, Boolean(item.syncedToCloud));
-          if (synced && !cancelled) {
-            await localMarkAppSynced(item.id, true);
+          const result = await cloudPublishOrUpdateApp(item, Boolean(item.syncedToCloud));
+          if (result.ok && result.syncedApp && !cancelled) {
+            await localMarkAppSynced(item.id, true, {
+              iconUrl: result.syncedApp.iconUrl,
+              screenshots: result.syncedApp.screenshots,
+            });
             setApps((prev) =>
-              prev.map((a) => (a.id === item.id ? { ...a, syncedToCloud: true } : a))
+              prev.map((a) => (a.id === item.id ? result.syncedApp! : a))
             );
           }
         } catch {
@@ -466,29 +495,48 @@ export default function App() {
       window.scrollTo({ top: 0, behavior: 'smooth' });
 
       try {
+        let backendDetail: AppDetailResponse | null = null;
         try {
           const res = await fetch(`./api/apps/${encodeURIComponent(appId)}`);
           const contentType = res.headers.get('content-type') || '';
           if (res.ok && contentType.includes('application/json')) {
-            const data = (await res.json()) as AppDetailResponse;
-            setDetailData({
-              app: { ...data.app, syncedToCloud: true },
-              reviews: data.reviews,
-            });
-            return;
+            backendDetail = (await res.json()) as AppDetailResponse;
           }
         } catch {
-          // Backend unavailable, continue to Firestore / IndexedDB / URL snapshot
+          // Backend unavailable
         }
 
-        try {
-          const cloudDetail = await cloudGetAppDetail(appId);
-          if (cloudDetail) {
-            setDetailData(cloudDetail);
-            return;
-          }
-        } catch {
-          // Continue to local store & URL snapshot fallback
+        const cloudDetail = await cloudGetAppDetail(appId).catch(() => null);
+
+        if (backendDetail && cloudDetail) {
+          const [mergedApp] = mergeAppLists(
+            [{ ...backendDetail.app, syncedToCloud: true }],
+            [cloudDetail.app]
+          );
+          const mergedReviews =
+            cloudDetail.reviews.length >= backendDetail.reviews.length
+              ? cloudDetail.reviews
+              : backendDetail.reviews;
+          setDetailData({ app: mergedApp, reviews: mergedReviews });
+          return;
+        }
+
+        if (cloudDetail) {
+          setDetailData(cloudDetail);
+          return;
+        }
+
+        if (backendDetail) {
+          setDetailData({
+            app: {
+              ...backendDetail.app,
+              syncedToCloud:
+                FALLBACK_APP_IDS.has(backendDetail.app.id) ||
+                Boolean(backendDetail.app.syncedToCloud),
+            },
+            reviews: backendDetail.reviews,
+          });
+          return;
         }
 
         const localDetail = await localGetAppDetail(appId).catch(() => null);

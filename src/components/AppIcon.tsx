@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Smartphone } from 'lucide-react';
 import { resolveAssetUrl } from '../catalog/fallbackStore.ts';
 
@@ -11,6 +11,10 @@ interface AppIconProps {
 export function AppIcon({ src, alt, className = 'w-16 h-16 rounded-2xl' }: AppIconProps) {
   const [failed, setFailed] = useState(false);
   const resolvedSrc = resolveAssetUrl(src);
+
+  useEffect(() => {
+    setFailed(false);
+  }, [resolvedSrc]);
 
   if (!resolvedSrc || failed) {
     return (

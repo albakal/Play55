@@ -16,12 +16,105 @@ const ROOT_DIR = process.cwd();
 const DATA_DIR = path.join(ROOT_DIR, 'data');
 const STORE_FILE = path.join(DATA_DIR, 'store.json');
 const UPLOADS_DIR = path.join(ROOT_DIR, 'uploads');
+const PUBLIC_UPLOADS_DIR = path.join(ROOT_DIR, 'public/uploads');
 const APKS_DIR = path.join(UPLOADS_DIR, 'apks');
 const ICONS_DIR = path.join(UPLOADS_DIR, 'icons');
 const SCREENSHOTS_DIR = path.join(UPLOADS_DIR, 'screenshots');
+const PUBLIC_ICONS_DIR = path.join(PUBLIC_UPLOADS_DIR, 'icons');
+const PUBLIC_SCREENSHOTS_DIR = path.join(PUBLIC_UPLOADS_DIR, 'screenshots');
 
-for (const dir of [DATA_DIR, UPLOADS_DIR, APKS_DIR, ICONS_DIR, SCREENSHOTS_DIR]) {
+for (const dir of [
+  DATA_DIR,
+  UPLOADS_DIR,
+  PUBLIC_UPLOADS_DIR,
+  APKS_DIR,
+  ICONS_DIR,
+  SCREENSHOTS_DIR,
+  PUBLIC_ICONS_DIR,
+  PUBLIC_SCREENSHOTS_DIR,
+]) {
   fs.mkdirSync(dir, { recursive: true });
+}
+
+function mirrorUploadToPublic(sourcePath: string, subfolder: 'icons' | 'screenshots', filename: string): void {
+  const destDir = subfolder === 'icons' ? PUBLIC_ICONS_DIR : PUBLIC_SCREENSHOTS_DIR;
+  const destPath = path.join(destDir, path.basename(filename));
+  fs.promises.copyFile(sourcePath, destPath).catch(() => {});
+}
+
+function scoreServerIconPath(entryPath: string, sizeBytes = 4096): number {
+  const lower = entryPath.toLowerCase();
+  if (
+    lower.endsWith('.9.png') ||
+    lower.includes('abc_') ||
+    lower.includes('notification') ||
+    lower.includes('ic_stat') ||
+    lower.includes('ic_menu') ||
+    lower.includes('btn_') ||
+    lower.includes('common_google') ||
+    lower.includes('design_') ||
+    lower.includes('mtrl_') ||
+    lower.includes('ic_launcher_background')
+  ) {
+    return -1;
+  }
+  let score = 0;
+  if (lower.includes('ic_launcher.png') || lower.includes('ic_launcher.webp')) score += 150;
+  else if (lower.includes('ic_launcher_round')) score += 125;
+  else if (lower.includes('ic_launcher_foreground')) score += 118;
+  else if (lower.includes('ic_launcher')) score += 105;
+  else if (lower.includes('launcher_icon') || lower.includes('app_icon') || lower.includes('appicon')) score += 95;
+  else if (/\/(icon|ic_app|logo|launcher)\.(png|webp|jpg|jpeg)$/.test(lower)) score += 85;
+  else if (lower.includes('mipmap')) score += 50;
+  else if (lower.includes('icon')) score += 30;
+  else return -1;
+
+  if (lower.includes('xxxhdpi')) score += 60;
+  else if (lower.includes('xxhdpi')) score += 50;
+  else if (lower.includes('xhdpi')) score += 40;
+  else if (lower.includes('hdpi')) score += 30;
+  else if (lower.includes('mdpi')) score += 20;
+
+  if (lower.endsWith('.png')) score += 10;
+  else if (lower.endsWith('.webp')) score += 8;
+
+  return score + Math.min(sizeBytes / 1024, 40);
+}
+
+async function extractBestIconFromApkBuffer(apkBuffer: Buffer): Promise<string | null> {
+  try {
+    const zip = await JSZip.loadAsync(apkBuffer);
+    const candidates = Object.values(zip.files).filter(
+      (entry) =>
+        !entry.dir &&
+        /\.(png|webp|jpg|jpeg)$/i.test(entry.name) &&
+        scoreServerIconPath(entry.name) >= 0
+    );
+    let bestEntry: JSZip.JSZipObject | null = null;
+    let bestBuf: Buffer | null = null;
+    let bestScore = -1;
+    for (const entry of candidates) {
+      const buf = await entry.async('nodebuffer');
+      if (buf.byteLength <= 80) continue;
+      const sc = scoreServerIconPath(entry.name, buf.byteLength);
+      if (sc > bestScore) {
+        bestScore = sc;
+        bestEntry = entry;
+        bestBuf = buf;
+      }
+    }
+    if (bestEntry && bestBuf) {
+      const ext = path.extname(bestEntry.name).toLowerCase() || '.png';
+      const iconName = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`;
+      const iconPath = path.join(ICONS_DIR, iconName);
+      await fs.promises.writeFile(iconPath, bestBuf);
+      mirrorUploadToPublic(iconPath, 'icons', iconName);
+      return `./uploads/icons/${iconName}`;
+    }
+  } catch {
+    // Ignore extraction failure
+  }
+  return null;
 }
 
 interface FirebaseAppletConfig {
@@ -839,6 +932,7 @@ async function startServer() {
 
   // Static uploaded media & persistent store assets
   app.use('/uploads', express.static(UPLOADS_DIR, { maxAge: '7d' }));
+  app.use('/uploads', express.static(PUBLIC_UPLOADS_DIR, { maxAge: '7d' }));
   app.use('/media', express.static(path.join(ROOT_DIR, 'public/media'), { maxAge: '7d' }));
 
   // Health check for full-stack runtime detection
@@ -1115,36 +1209,22 @@ async function startServer() {
         }
 
         const iconFile = files?.icon?.[0];
-        let iconUrl = './api/brand-icon/nabd';
+        let iconUrl = './media/store/brand_nabd.svg';
 
         if (iconFile) {
+          mirrorUploadToPublic(iconFile.path, 'icons', iconFile.filename);
           iconUrl = `./uploads/icons/${iconFile.filename}`;
         } else {
-          // Server-side fallback: attempt to extract icon directly from uploaded APK
-          try {
-            const zip = await JSZip.loadAsync(apkBuffer);
-            const candidates = Object.values(zip.files).filter(
-              (entry) =>
-                !entry.dir &&
-                /\.(png|webp|jpg|jpeg)$/i.test(entry.name) &&
-                !entry.name.toLowerCase().endsWith('.9.png') &&
-                /ic_launcher|app_icon|icon/i.test(entry.name)
-            );
-            candidates.sort((a, b) => b.name.length - a.name.length);
-            if (candidates.length > 0) {
-              const chosen = candidates[0];
-              const buf = await chosen.async('nodebuffer');
-              const ext = path.extname(chosen.name).toLowerCase() || '.png';
-              const iconName = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${ext}`;
-              await fs.promises.writeFile(path.join(ICONS_DIR, iconName), buf);
-              iconUrl = `./uploads/icons/${iconName}`;
-            }
-          } catch {
-            // Keep default SVG icon fallback
+          const extractedIcon = await extractBestIconFromApkBuffer(apkBuffer);
+          if (extractedIcon) {
+            iconUrl = extractedIcon;
           }
         }
 
         const screenshotFiles = files?.screenshots || [];
+        for (const f of screenshotFiles) {
+          mirrorUploadToPublic(f.path, 'screenshots', f.filename);
+        }
         const screenshots = screenshotFiles.map((f) => `./uploads/screenshots/${f.filename}`);
 
         const sizeMB = Number(body.sizeMB) || Number((finalSizeBytes / (1024 * 1024)).toFixed(2)) || 0.1;
@@ -1302,10 +1382,22 @@ async function startServer() {
         const iconFile = files?.icon?.[0];
         let nextIconUrl = target.iconUrl;
         if (iconFile) {
+          mirrorUploadToPublic(iconFile.path, 'icons', iconFile.filename);
           nextIconUrl = `./uploads/icons/${iconFile.filename}`;
+        } else if (apkFile) {
+          const apkBuf = await fs.promises.readFile(apkFile.path).catch(() => null);
+          if (apkBuf) {
+            const extractedIcon = await extractBestIconFromApkBuffer(apkBuf);
+            if (extractedIcon) {
+              nextIconUrl = extractedIcon;
+            }
+          }
         }
 
         const screenshotFiles = files?.screenshots || [];
+        for (const f of screenshotFiles) {
+          mirrorUploadToPublic(f.path, 'screenshots', f.filename);
+        }
         const nextScreenshots =
           screenshotFiles.length > 0
             ? screenshotFiles.map((f) => `./uploads/screenshots/${f.filename}`)

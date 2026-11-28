@@ -101,7 +101,7 @@ function sanitizeImageRefForHash(url: string, maxDataLen: number): string {
     return trimmed.length <= maxDataLen ? trimmed : '';
   }
   const storeMatch =
-    /^\.?\/?(?:src\/assets\/images|media\/store)\/([a-zA-Z0-9._-]+\.(?:jpg|jpeg|png|webp))$/i.exec(
+    /^\.?\/?(?:src\/assets\/images|media\/store)\/([a-zA-Z0-9._-]+\.(?:jpg|jpeg|png|webp|svg))$/i.exec(
       trimmed
     );
   if (storeMatch?.[1]) {
@@ -179,11 +179,11 @@ export function buildPermanentAppShareUrl(
     ma: app.minAndroid.slice(0, 40),
     ar: app.ageRating.slice(0, 16),
     sz: Number(app.sizeMB.toFixed(2)),
-    ic: sanitizeImageRefForHash(app.iconUrl, 10_000) || undefined,
+    ic: sanitizeImageRefForHash(app.iconUrl, 12_000) || undefined,
     sc: (app.screenshots || [])
-      .map((s) => sanitizeImageRefForHash(s, 2000))
+      .map((s) => sanitizeImageRefForHash(s, 10_000))
       .filter(Boolean)
-      .slice(0, 4),
+      .slice(0, 3),
     fn: (app.apkFilename || '').slice(0, 180) || undefined,
     hc: app.hasCustomApk,
     bm: app.isBinaryManifest,
@@ -200,11 +200,15 @@ export function buildPermanentAppShareUrl(
   };
 
   try {
-    const encoded = encodeBase64UrlUtf8(JSON.stringify(compact));
-    if (encoded.length > 14_000) {
+    let encoded = encodeBase64UrlUtf8(JSON.stringify(compact));
+    while (encoded.length > 36_000 && compact.sc && compact.sc.length > 0) {
+      compact.sc.pop();
+      encoded = encodeBase64UrlUtf8(JSON.stringify(compact));
+    }
+    if (encoded.length > 36_000) {
       delete compact.ic;
       compact.sc = [];
-      return `${baseUrl}#p55=${encodeBase64UrlUtf8(JSON.stringify(compact))}`;
+      encoded = encodeBase64UrlUtf8(JSON.stringify(compact));
     }
     return `${baseUrl}#p55=${encoded}`;
   } catch {

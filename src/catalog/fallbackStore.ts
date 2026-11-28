@@ -51,10 +51,16 @@ const ASSET_MAP: Record<string, string> = {
   './media/store/promo_screen_audio_1795812504131.jpg': promoAudioImg,
   '/api/brand-icon/nabd': ICON_NABD,
   './api/brand-icon/nabd': ICON_NABD,
+  '/media/store/brand_nabd.svg': ICON_NABD,
+  './media/store/brand_nabd.svg': ICON_NABD,
   '/api/brand-icon/bayan': ICON_BAYAN,
   './api/brand-icon/bayan': ICON_BAYAN,
+  '/media/store/brand_bayan.svg': ICON_BAYAN,
+  './media/store/brand_bayan.svg': ICON_BAYAN,
   '/api/brand-icon/lens': ICON_LENS,
   './api/brand-icon/lens': ICON_LENS,
+  '/media/store/brand_lens.svg': ICON_LENS,
+  './media/store/brand_lens.svg': ICON_LENS,
 };
 
 export function resolveAssetUrl(url: string): string {
@@ -80,6 +86,12 @@ export function resolveAssetUrl(url: string): string {
     return `.${normalized}`;
   }
   if (normalized.startsWith('media/')) {
+    return `./${normalized}`;
+  }
+  if (normalized.startsWith('/assets/')) {
+    return `.${normalized}`;
+  }
+  if (normalized.startsWith('assets/')) {
     return `./${normalized}`;
   }
   return normalized;

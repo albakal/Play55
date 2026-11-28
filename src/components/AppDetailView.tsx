@@ -100,7 +100,7 @@ export function AppDetailView({
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const [copiedShare, setCopiedShare] = useState(false);
   const [lightboxImage, setLightboxImage] = useState<string | null>(null);
-  const [brokenShots, setBrokenShots] = useState<Record<number, boolean>>({});
+  const [brokenShots, setBrokenShots] = useState<Record<string, boolean>>({});
   const [confirmDelete, setConfirmDelete] = useState(false);
 
   // Review form state
@@ -134,7 +134,7 @@ export function AppDetailView({
     setConfirmDelete(false);
     setReviewError(null);
     setReviewSuccess(false);
-  }, [app.id]);
+  }, [app.id, app.updatedAt]);
 
   useEffect(() => {
     if (!showQrPanel) return;
@@ -806,18 +806,20 @@ export function AppDetailView({
       </section>
 
       {/* Promotional Screenshots Gallery */}
-      {app.screenshots.length > 0 && (
-        <section className="space-y-4">
-          <h2 className="font-display text-lg font-bold text-[#202124]">
-            الصور الترويجية للتطبيق
-          </h2>
-          <div className="flex gap-4 overflow-x-auto pb-2 no-scrollbar">
-            {app.screenshots.map((shot, idx) => {
-              const resolvedShot = resolveAssetUrl(shot);
-              if (!resolvedShot || brokenShots[idx]) return null;
-              return (
+      {(() => {
+        const resolvedShots = (app.screenshots || [])
+          .map((shot) => resolveAssetUrl(shot))
+          .filter((resolvedShot) => Boolean(resolvedShot) && !brokenShots[resolvedShot]);
+        if (resolvedShots.length === 0) return null;
+        return (
+          <section className="space-y-4">
+            <h2 className="font-display text-lg font-bold text-[#202124]">
+              الصور الترويجية للتطبيق
+            </h2>
+            <div className="flex gap-4 overflow-x-auto pb-2 no-scrollbar">
+              {resolvedShots.map((resolvedShot, idx) => (
                 <button
-                  key={`${shot}-${idx}`}
+                  key={`${resolvedShot}-${idx}`}
                   type="button"
                   onClick={() => setLightboxImage(resolvedShot)}
                   className="group relative shrink-0 w-72 sm:w-96 aspect-video rounded-2xl overflow-hidden border border-[#E8EAED] bg-[#F8F9FA] focus-visible:outline-2 focus-visible:outline-[#01875F]"
@@ -826,15 +828,17 @@ export function AppDetailView({
                     src={resolvedShot}
                     alt={`صورة ترويجية ${idx + 1} لتطبيق ${app.name}`}
                     referrerPolicy="no-referrer"
-                    onError={() => setBrokenShots((prev) => ({ ...prev, [idx]: true }))}
+                    onError={() =>
+                      setBrokenShots((prev) => ({ ...prev, [resolvedShot]: true }))
+                    }
                     className="w-full h-full object-cover group-hover:scale-[1.02] transition-transform duration-200"
                   />
                 </button>
-              );
-            })}
-          </div>
-        </section>
-      )}
+              ))}
+            </div>
+          </section>
+        );
+      })()}
 
       {/* About This App & Technical Specs */}
       <section className="grid grid-cols-1 lg:grid-cols-3 gap-8 pt-2">

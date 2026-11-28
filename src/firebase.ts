@@ -234,7 +234,7 @@ function computeStatsFromReviews(reviews: ReviewItem[]) {
   };
 }
 
-function isUnportableMediaRef(url: string): boolean {
+export function isUnportableMediaRef(url: string): boolean {
   if (!url || typeof url !== 'string') return false;
   const trimmed = url.trim();
   if (!trimmed) return false;
@@ -249,9 +249,28 @@ function isUnportableMediaRef(url: string): boolean {
   );
 }
 
+export function isPortableMediaRef(url: string): boolean {
+  if (!url || typeof url !== 'string') return false;
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  if (isUnportableMediaRef(trimmed)) return false;
+  return (
+    trimmed.startsWith('data:image/') ||
+    trimmed.startsWith('./media/') ||
+    trimmed.startsWith('/media/') ||
+    trimmed.startsWith('./api/brand-icon/') ||
+    trimmed.startsWith('/api/brand-icon/') ||
+    trimmed.startsWith('https://')
+  );
+}
+
 export function needsCloudMediaRepair(appData: StoreApp): boolean {
-  if (isUnportableMediaRef(appData.iconUrl)) return true;
-  return (appData.screenshots || []).some((s) => isUnportableMediaRef(s));
+  if (!appData.iconUrl || !appData.iconUrl.trim() || isUnportableMediaRef(appData.iconUrl)) {
+    return true;
+  }
+  return (appData.screenshots || []).some(
+    (s) => !s || !s.trim() || isUnportableMediaRef(s)
+  );
 }
 
 function normalizeStaticStoreMediaRef(url: string): string | null {
@@ -261,7 +280,7 @@ function normalizeStaticStoreMediaRef(url: string): string | null {
     return `./api/brand-icon/${brandMatch[1].toLowerCase()}`;
   }
   const storeMatch =
-    /^\.?\/?(?:src\/assets\/images|media\/store)\/([a-zA-Z0-9._-]+\.(?:jpg|jpeg|png|webp))$/i.exec(
+    /^\.?\/?(?:src\/assets\/images|media\/store)\/([a-zA-Z0-9._-]+\.(?:jpg|jpeg|png|webp|svg))$/i.exec(
       trimmed
     );
   if (storeMatch?.[1]) {
@@ -281,34 +300,66 @@ async function renderImageSourceToCompressedDataUrl(
 
   return await new Promise<string>((resolve) => {
     const img = new Image();
-    img.crossOrigin = 'anonymous';
+    // Never set crossOrigin on data: or blob: URLs; some mobile WebViews fail decoding them when crossOrigin is set
+    if (/^https?:\/\//i.test(src)) {
+      try {
+        if (typeof window !== 'undefined' && new URL(src).origin !== window.location.origin) {
+          img.crossOrigin = 'anonymous';
+        }
+      } catch {
+        // Ignore URL parsing issues
+      }
+    }
+
     img.onload = () => {
       try {
-        const ratio = Math.min(1, maxDim / Math.max(img.width || 1, img.height || 1));
-        const width = Math.max(1, Math.round((img.width || maxDim) * ratio));
-        const height = Math.max(1, Math.round((img.height || maxDim) * ratio));
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          resolve('');
-          return;
-        }
-        ctx.drawImage(img, 0, 0, width, height);
-
+        const naturalW = img.naturalWidth || img.width || maxDim;
+        const naturalH = img.naturalHeight || img.height || maxDim;
+        const dimFactors = [1, 0.72, 0.5, 0.34];
         const attempts: Array<[string, number]> = [
-          ['image/webp', 0.82],
+          ['image/webp', 0.84],
           ['image/webp', 0.68],
-          ['image/webp', 0.52],
-          ['image/jpeg', 0.75],
-          ['image/jpeg', 0.58],
+          ['image/webp', 0.5],
+          ['image/jpeg', 0.78],
+          ['image/jpeg', 0.6],
           ['image/jpeg', 0.42],
         ];
-        for (const [mime, quality] of attempts) {
-          const out = canvas.toDataURL(mime, quality);
-          if (out.startsWith(`data:${mime}`) && out.length <= maxChars) {
-            resolve(out);
+
+        for (const factor of dimFactors) {
+          const targetDim = Math.max(64, Math.round(maxDim * factor));
+          const ratio = Math.min(1, targetDim / Math.max(naturalW, naturalH, 1));
+          const width = Math.max(1, Math.round(naturalW * ratio));
+          const height = Math.max(1, Math.round(naturalH * ratio));
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            resolve('');
+            return;
+          }
+          ctx.clearRect(0, 0, width, height);
+          ctx.drawImage(img, 0, 0, width, height);
+
+          for (const [mime, quality] of attempts) {
+            const out = canvas.toDataURL(mime, quality);
+            if (out.startsWith(`data:${mime}`) && out.length <= maxChars) {
+              resolve(out);
+              return;
+            }
+          }
+        }
+
+        // Last-resort tiny JPEG/PNG thumbnail so uploaded visuals are never dropped completely
+        const fallbackCanvas = document.createElement('canvas');
+        fallbackCanvas.width = 96;
+        fallbackCanvas.height = Math.max(48, Math.round((naturalH / Math.max(naturalW, 1)) * 96));
+        const fCtx = fallbackCanvas.getContext('2d');
+        if (fCtx) {
+          fCtx.drawImage(img, 0, 0, fallbackCanvas.width, fallbackCanvas.height);
+          const smallJpg = fallbackCanvas.toDataURL('image/jpeg', 0.4);
+          if (smallJpg.startsWith('data:image/') && smallJpg.length <= maxChars) {
+            resolve(smallJpg);
             return;
           }
         }
@@ -322,9 +373,37 @@ async function renderImageSourceToCompressedDataUrl(
   });
 }
 
+export async function compressBlobToDataUrl(
+  blob: Blob,
+  maxChars = 90_000,
+  maxDim = 512
+): Promise<string> {
+  if (typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function' && typeof document !== 'undefined') {
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      const compressed = await renderImageSourceToCompressedDataUrl(objectUrl, maxChars, maxDim);
+      if (compressed) return compressed;
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
+  }
+  if (typeof FileReader !== 'undefined') {
+    return await new Promise<string>((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const res = String(reader.result || '');
+        resolve(res.length <= maxChars ? res : '');
+      };
+      reader.onerror = () => resolve('');
+      reader.readAsDataURL(blob);
+    });
+  }
+  return '';
+}
+
 export async function compressImageDataUrlForCloud(
   url: string,
-  maxChars = 110_000,
+  maxChars = 95_000,
   maxDim = 256
 ): Promise<string> {
   if (!url || typeof url !== 'string') return '';
@@ -348,13 +427,14 @@ export async function compressImageDataUrlForCloud(
   }
 
   // Relative upload path (./uploads/..., /uploads/...) or blob: URL -> fetch & convert to portable data URL
-  const fetchTarget = trimmed.startsWith('/uploads/')
-    ? `.${trimmed}`
-    : trimmed.startsWith('uploads/')
-    ? `./${trimmed}`
-    : trimmed;
+  const normalizedRel = trimmed.replace(/^\/Play55(?=\/)/i, '');
+  const fetchTarget = normalizedRel.startsWith('/uploads/')
+    ? `.${normalizedRel}`
+    : normalizedRel.startsWith('uploads/')
+    ? `./${normalizedRel}`
+    : normalizedRel;
 
-  if (typeof fetch !== 'function' || typeof URL === 'undefined') {
+  if (typeof fetch !== 'function') {
     return '';
   }
 
@@ -365,12 +445,7 @@ export async function compressImageDataUrlForCloud(
       return '';
     }
     const blob = await res.blob();
-    const objectUrl = URL.createObjectURL(blob);
-    try {
-      return await renderImageSourceToCompressedDataUrl(objectUrl, maxChars, maxDim);
-    } finally {
-      URL.revokeObjectURL(objectUrl);
-    }
+    return await compressBlobToDataUrl(blob, maxChars, maxDim);
   } catch {
     return '';
   }
@@ -442,36 +517,68 @@ export async function cloudGetAppDetail(appId: string): Promise<AppDetailRespons
 
 export async function cloudPublishOrUpdateApp(
   appData: StoreApp,
-  isUpdate: boolean
-): Promise<boolean> {
+  isUpdate: boolean,
+  fallbackExistingMedia?: { iconUrl?: string; screenshots?: string[] }
+): Promise<{ ok: boolean; syncedApp?: StoreApp }> {
   const fbUser = auth.currentUser;
   if (!fbUser || !fbUser.emailVerified || !isValidAppId(appData.id)) {
-    return false;
+    return { ok: false };
   }
   if (appData.ownerUid && appData.ownerUid !== fbUser.uid) {
-    return false;
+    return { ok: false };
   }
 
   const docPath = `apps/${appData.id}`;
   const ref = doc(db, 'apps', appData.id);
 
-  const safeIconUrl = await compressImageDataUrlForCloud(appData.iconUrl, 110_000, 256);
-  const safeScreenshots: string[] = [];
-  for (const s of (appData.screenshots || []).slice(0, 4)) {
-    const compressed = await compressImageDataUrlForCloud(s, 110_000, 720);
+  let safeIconUrl = await compressImageDataUrlForCloud(appData.iconUrl, 90_000, 256);
+  if (!safeIconUrl && fallbackExistingMedia?.iconUrl) {
+    safeIconUrl = await compressImageDataUrlForCloud(fallbackExistingMedia.iconUrl, 90_000, 256);
+  }
+  if (!safeIconUrl) {
+    safeIconUrl = './media/store/brand_nabd.svg';
+  }
+
+  const rawShots = (appData.screenshots || []).slice(0, 4);
+  let safeScreenshots: string[] = [];
+  for (let i = 0; i < rawShots.length; i++) {
+    let compressed = await compressImageDataUrlForCloud(rawShots[i], 100_000, 720);
+    if (!compressed && fallbackExistingMedia?.screenshots?.[i]) {
+      compressed = await compressImageDataUrlForCloud(
+        fallbackExistingMedia.screenshots[i],
+        100_000,
+        720
+      );
+    }
     if (compressed) {
       safeScreenshots.push(compressed);
     }
   }
 
+  // Keep total document size comfortably under Firestore 1 MiB limit
+  const totalMediaLen = () =>
+    safeIconUrl.length + safeScreenshots.reduce((acc, s) => acc + s.length, 0);
+  if (totalMediaLen() > 650_000 && safeScreenshots.length > 0) {
+    const recompacted: string[] = [];
+    for (const s of safeScreenshots) {
+      recompacted.push((await compressImageDataUrlForCloud(s, 70_000, 540)) || s);
+    }
+    safeScreenshots = recompacted;
+  }
+
   const safeExternalUrl = sanitizeHttpsExternalUrl(appData.externalApkUrl);
 
+  const cleanName = appData.name.trim().slice(0, 120) || 'تطبيق';
+  const cleanDeveloper = (appData.developer.trim() || fbUser.displayName || 'مطور مستقل').slice(0, 120);
+  const cleanShortDesc = (appData.shortDescription.trim() || cleanName).slice(0, 240);
+  const cleanFullDesc = (appData.fullDescription.trim() || cleanShortDesc || cleanName).slice(0, 5000);
+
   const mutableFields: Record<string, unknown> = {
-    name: appData.name.trim().slice(0, 120) || 'تطبيق',
-    developer: (appData.developer.trim() || fbUser.displayName || 'مطور مستقل').slice(0, 120),
+    name: cleanName,
+    developer: cleanDeveloper,
     category: String(appData.category || 'الأدوات').slice(0, 40),
-    shortDescription: (appData.shortDescription.trim() || appData.name).slice(0, 240),
-    fullDescription: (appData.fullDescription.trim() || appData.shortDescription || appData.name).slice(0, 5000),
+    shortDescription: cleanShortDesc,
+    fullDescription: cleanFullDesc,
     whatsNew: (appData.whatsNew || '').trim().slice(0, 1000),
     packageName: (appData.packageName.trim() || 'com.app.android').slice(0, 160),
     versionName: (appData.versionName.trim() || '1.0.0').slice(0, 64),
@@ -503,6 +610,19 @@ export async function cloudPublishOrUpdateApp(
     mutableFields.apkSha256 = appData.apkSha256.slice(0, 128);
   }
 
+  const syncedAppResult: StoreApp = {
+    ...appData,
+    name: cleanName,
+    developer: cleanDeveloper,
+    shortDescription: cleanShortDesc,
+    fullDescription: cleanFullDesc,
+    iconUrl: safeIconUrl,
+    screenshots: safeScreenshots,
+    externalApkUrl: safeExternalUrl,
+    syncedToCloud: true,
+    ownerUid: appData.ownerUid || fbUser.uid,
+  };
+
   try {
     const existingSnap = isUpdate ? await getDoc(ref) : null;
 
@@ -514,7 +634,7 @@ export async function cloudPublishOrUpdateApp(
         updatePayload.externalApkUrl = deleteField();
       }
       await updateDoc(ref, updatePayload);
-      return true;
+      return { ok: true, syncedApp: syncedAppResult };
     }
 
     const createPayload: Record<string, unknown> = {
@@ -536,7 +656,7 @@ export async function cloudPublishOrUpdateApp(
     };
 
     await setDoc(ref, createPayload);
-    return true;
+    return { ok: true, syncedApp: syncedAppResult };
   } catch (error) {
     handleFirestoreError(error, isUpdate ? OperationType.UPDATE : OperationType.CREATE, docPath);
   }
