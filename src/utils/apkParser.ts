@@ -333,6 +333,14 @@ export async function parseApkFile(file: File): Promise<ExtractedApkInfo> {
     );
     const hasV2SigBlock = hasAsciiBytes(new Uint8Array(arrayBuffer), 'APK Sig Block 42');
     defaults.isSignedApk = hasMetaInfCert || hasV2SigBlock;
+    defaults.signatureScheme =
+      hasMetaInfCert && hasV2SigBlock
+        ? 'v1+v2'
+        : hasV2SigBlock
+        ? 'v2/v3'
+        : hasMetaInfCert
+        ? 'v1'
+        : 'unsigned';
     defaults.apkSha256 = await computeSha256Hex(arrayBuffer);
 
     const parsed = parseBinaryAndroidManifest(manifestBuffer);

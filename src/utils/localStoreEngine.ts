@@ -496,6 +496,7 @@ export async function localPublishApp(params: {
   sizeMB: number;
   isBinaryManifest?: boolean;
   isSignedApk?: boolean;
+  signatureScheme?: string;
   apkSha256?: string;
   externalApkUrl?: string;
   permissionsCount: number;
@@ -535,6 +536,7 @@ export async function localPublishApp(params: {
     hasCustomApk: true,
     isBinaryManifest: params.isBinaryManifest,
     isSignedApk: params.isSignedApk,
+    signatureScheme: params.signatureScheme,
     apkSha256: params.apkSha256,
     externalApkUrl: sanitizeHttpsApkUrlClient(params.externalApkUrl),
     permissionsCount: params.permissionsCount,
@@ -573,6 +575,7 @@ export async function localUpdateApp(params: {
   sizeMB?: number;
   isBinaryManifest?: boolean;
   isSignedApk?: boolean;
+  signatureScheme?: string;
   apkSha256?: string;
   externalApkUrl?: string;
   permissionsCount?: number;
@@ -627,6 +630,7 @@ export async function localUpdateApp(params: {
     hasCustomApk: params.existingApp.hasCustomApk || Boolean(params.apkFile),
     isBinaryManifest: params.isBinaryManifest ?? params.existingApp.isBinaryManifest,
     isSignedApk: params.isSignedApk ?? params.existingApp.isSignedApk,
+    signatureScheme: params.signatureScheme ?? params.existingApp.signatureScheme,
     apkSha256: params.apkSha256 ?? params.existingApp.apkSha256,
     externalApkUrl: nextExternalUrl,
     permissionsCount: params.permissionsCount ?? params.existingApp.permissionsCount,
@@ -641,6 +645,7 @@ export async function localVerifyApkBlob(app: StoreApp): Promise<{
   valid: boolean;
   isBinaryManifest: boolean;
   isSignedApk: boolean;
+  signatureScheme?: string;
   sha256?: string;
   externalApkUrl?: string;
   hasCustomApk: boolean;
@@ -651,6 +656,7 @@ export async function localVerifyApkBlob(app: StoreApp): Promise<{
       valid: true,
       isBinaryManifest: Boolean(app.isBinaryManifest),
       isSignedApk: Boolean(app.isSignedApk),
+      signatureScheme: app.signatureScheme,
       sha256: app.apkSha256,
       externalApkUrl: safeExternalUrl,
       hasCustomApk: app.hasCustomApk,
@@ -685,6 +691,7 @@ export async function localVerifyApkBlob(app: StoreApp): Promise<{
       valid: true,
       isBinaryManifest,
       isSignedApk: hasCert || Boolean(app.isSignedApk),
+      signatureScheme: app.signatureScheme || (hasCert ? 'v1' : undefined),
       sha256,
       externalApkUrl: safeExternalUrl,
       hasCustomApk: app.hasCustomApk,

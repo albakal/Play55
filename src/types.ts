@@ -37,6 +37,8 @@ export interface StoreApp {
   hasCustomApk: boolean;
   isBinaryManifest?: boolean;
   isSignedApk?: boolean;
+  signatureScheme?: string;
+  signerCertSha256?: string;
   apkSha256?: string;
   externalApkUrl?: string;
   permissionsCount: number;
@@ -81,6 +83,7 @@ export interface ExtractedApkInfo {
   isValidZipApk: boolean;
   isBinaryManifest: boolean;
   isSignedApk: boolean;
+  signatureScheme?: string;
   apkSha256?: string;
   validationError?: string;
   iconDataUrl: string | null;

@@ -7,6 +7,10 @@ import JSZip from 'jszip';
 import { getApp, getApps, initializeApp } from 'firebase-admin/app';
 import { getAuth as getAdminAuth } from 'firebase-admin/auth';
 import type { AppCategory, ReviewItem, StoreApp } from './src/types.ts';
+import {
+  inspectApkSignatureDetails,
+  signUnsignedApkBuffer,
+} from './server/apkSigner.ts';
 
 const ROOT_DIR = process.cwd();
 const DATA_DIR = path.join(ROOT_DIR, 'data');
@@ -264,6 +268,8 @@ interface ApkInspectionResult {
   valid: boolean;
   isBinaryManifest: boolean;
   isSignedApk: boolean;
+  signatureScheme?: string;
+  signerCertSha256?: string;
   sha256: string;
   error?: string;
 }
@@ -315,13 +321,13 @@ async function inspectApkBuffer(buffer: Buffer): Promise<ApkInspectionResult> {
     }
     const manifestBuf = await manifest.async('nodebuffer');
     const isBinaryManifest = manifestBuf.byteLength >= 4 && manifestBuf.readUInt16LE(0) === 0x0003;
-    const fileNames = Object.keys(zip.files);
-    const hasCert = fileNames.some((n) => /^META-INF\/.+\.(RSA|DSA|EC|SF)$/i.test(n));
-    const hasV2Sig = buffer.includes('APK Sig Block 42');
+    const sigDetails = await inspectApkSignatureDetails(buffer, zip);
     return {
       valid: true,
       isBinaryManifest,
-      isSignedApk: hasCert || hasV2Sig,
+      isSignedApk: sigDetails.isSignedApk,
+      signatureScheme: sigDetails.signatureScheme,
+      signerCertSha256: sigDetails.signerCertSha256,
       sha256,
     };
   } catch {
@@ -787,7 +793,13 @@ async function buildDynamicApkBuffer(app: StoreApp): Promise<Buffer> {
       developer: app.developer,
     })
   );
-  return zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  const rawZip = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
+  try {
+    const { signedBuffer } = await signUnsignedApkBuffer(rawZip);
+    return signedBuffer;
+  } catch {
+    return rawZip;
+  }
 }
 
 function renderBrandIconSvg(slug: string): string {
@@ -968,9 +980,17 @@ async function startServer() {
     if (fs.existsSync(atlasIconPath)) {
       zip.file('res/mipmap-xxxhdpi-v4/ic_launcher.png', fs.readFileSync(atlasIconPath));
     }
-    const buf = await zip.generateAsync({ type: 'nodebuffer' });
+    const rawBuf = await zip.generateAsync({ type: 'nodebuffer' });
+    let buf = rawBuf;
+    try {
+      const signed = await signUnsignedApkBuffer(rawBuf);
+      buf = signed.signedBuffer;
+    } catch {
+      buf = rawBuf;
+    }
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
     res.setHeader('Content-Disposition', 'attachment; filename="noor-smartnotes-v2.4.0.apk"');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
     res.send(buf);
   });
 
@@ -1070,12 +1090,27 @@ async function startServer() {
           return;
         }
 
-        const apkBuffer = await fs.promises.readFile(apkFile.path);
-        const inspection = await inspectApkBuffer(apkBuffer);
+        let apkBuffer: Buffer = await fs.promises.readFile(apkFile.path);
+        let inspection = await inspectApkBuffer(apkBuffer);
         if (!inspection.valid) {
           fs.promises.unlink(apkFile.path).catch(() => {});
           res.status(400).json({ error: inspection.error || 'ملف APK غير صالح' });
           return;
+        }
+
+        let finalSizeBytes = apkFile.size;
+        if (!inspection.isSignedApk && body.autoSignUnsigned === 'true') {
+          try {
+            const signed = await signUnsignedApkBuffer(apkBuffer);
+            if (!signed.alreadySigned) {
+              await fs.promises.writeFile(apkFile.path, signed.signedBuffer);
+              apkBuffer = signed.signedBuffer;
+              finalSizeBytes = signed.signedBuffer.byteLength;
+              inspection = await inspectApkBuffer(apkBuffer);
+            }
+          } catch (signErr) {
+            console.warn('Auto-sign skipped:', signErr);
+          }
         }
 
         const iconFile = files?.icon?.[0];
@@ -1111,7 +1146,7 @@ async function startServer() {
         const screenshotFiles = files?.screenshots || [];
         const screenshots = screenshotFiles.map((f) => `/uploads/screenshots/${f.filename}`);
 
-        const sizeMB = Number(body.sizeMB) || Number((apkFile.size / (1024 * 1024)).toFixed(2)) || 0.1;
+        const sizeMB = Number(body.sizeMB) || Number((finalSizeBytes / (1024 * 1024)).toFixed(2)) || 0.1;
         const now = new Date().toISOString();
         const newApp: StoreApp = {
           id: `app-${crypto.randomBytes(5).toString('hex')}`,
@@ -1133,6 +1168,8 @@ async function startServer() {
           hasCustomApk: true,
           isBinaryManifest: inspection.isBinaryManifest,
           isSignedApk: inspection.isSignedApk,
+          signatureScheme: inspection.signatureScheme,
+          signerCertSha256: inspection.signerCertSha256,
           apkSha256: inspection.sha256,
           externalApkUrl: sanitizeHttpsApkUrl(body.externalApkUrl),
           permissionsCount: Number(body.permissionsCount) || 0,
@@ -1215,22 +1252,40 @@ async function startServer() {
         let nextSizeMB = target.sizeMB;
         let nextBinaryManifest = target.isBinaryManifest;
         let nextSignedApk = target.isSignedApk;
+        let nextSignatureScheme = target.signatureScheme;
+        let nextSignerCertSha256 = target.signerCertSha256;
         let nextSha256 = target.apkSha256;
         let nextPermissionsCount = target.permissionsCount;
 
         if (apkFile) {
-          const apkBuffer = await fs.promises.readFile(apkFile.path);
-          const inspection = await inspectApkBuffer(apkBuffer);
+          let apkBuffer: Buffer = await fs.promises.readFile(apkFile.path);
+          let inspection = await inspectApkBuffer(apkBuffer);
           if (!inspection.valid) {
             fs.promises.unlink(apkFile.path).catch(() => {});
             res.status(400).json({ error: inspection.error || 'ملف APK المحدث غير صالح' });
             return;
           }
+          let finalSizeBytes = apkFile.size;
+          if (!inspection.isSignedApk && body.autoSignUnsigned === 'true') {
+            try {
+              const signed = await signUnsignedApkBuffer(apkBuffer);
+              if (!signed.alreadySigned) {
+                await fs.promises.writeFile(apkFile.path, signed.signedBuffer);
+                apkBuffer = signed.signedBuffer;
+                finalSizeBytes = signed.signedBuffer.byteLength;
+                inspection = await inspectApkBuffer(apkBuffer);
+              }
+            } catch (signErr) {
+              console.warn('Auto-sign update skipped:', signErr);
+            }
+          }
           const oldFilename = target.apkFilename;
           nextApkFilename = apkFile.filename;
-          nextSizeMB = Number(body.sizeMB) || Number((apkFile.size / (1024 * 1024)).toFixed(2)) || target.sizeMB;
+          nextSizeMB = Number(body.sizeMB) || Number((finalSizeBytes / (1024 * 1024)).toFixed(2)) || target.sizeMB;
           nextBinaryManifest = inspection.isBinaryManifest;
           nextSignedApk = inspection.isSignedApk;
+          nextSignatureScheme = inspection.signatureScheme;
+          nextSignerCertSha256 = inspection.signerCertSha256;
           nextSha256 = inspection.sha256;
           nextPermissionsCount = Number(body.permissionsCount) || target.permissionsCount;
 
@@ -1280,6 +1335,8 @@ async function startServer() {
         target.hasCustomApk = target.hasCustomApk || Boolean(apkFile);
         target.isBinaryManifest = nextBinaryManifest;
         target.isSignedApk = nextSignedApk;
+        target.signatureScheme = nextSignatureScheme;
+        target.signerCertSha256 = nextSignerCertSha256;
         target.apkSha256 = nextSha256;
         target.externalApkUrl = nextExternalUrl;
         target.permissionsCount = nextPermissionsCount;
@@ -1323,6 +1380,8 @@ async function startServer() {
           valid: inspection.valid,
           isBinaryManifest: inspection.isBinaryManifest,
           isSignedApk: inspection.isSignedApk,
+          signatureScheme: inspection.signatureScheme || null,
+          signerCertSha256: inspection.signerCertSha256 || null,
           sha256: inspection.sha256,
           externalApkUrl: found.externalApkUrl || null,
           sizeBytes: buf.byteLength,
@@ -1337,6 +1396,8 @@ async function startServer() {
       valid: true,
       isBinaryManifest: Boolean(found.isBinaryManifest),
       isSignedApk: Boolean(found.isSignedApk),
+      signatureScheme: found.signatureScheme || null,
+      signerCertSha256: found.signerCertSha256 || null,
       sha256: found.apkSha256 || null,
       externalApkUrl: found.externalApkUrl || null,
       sizeBytes: Math.round(found.sizeMB * 1024 * 1024),

@@ -4,11 +4,13 @@ import QRCode from 'qrcode';
 import {
   AlertTriangle,
   ArrowRight,
+  CheckCircle2,
   Copy,
   Download,
   Edit3,
   Link2,
   QrCode,
+  RefreshCw,
   Share2,
   ShieldCheck,
   Smartphone,
@@ -27,6 +29,13 @@ import {
   localVerifyApkBlob,
   localVoteHelpful,
 } from '../utils/localStoreEngine.ts';
+import {
+  getAppDownloadInfo,
+  getDownloadedAppsMap,
+  INSTALL_HISTORY_EVENT,
+  recordAppDownload,
+} from '../utils/installHistory.ts';
+import type { DownloadedAppRecord } from '../utils/installHistory.ts';
 import { AppIcon } from './AppIcon.tsx';
 import { StarRating } from './StarRating.tsx';
 
@@ -75,10 +84,15 @@ export function AppDetailView({
   const [apkCheckInfo, setApkCheckInfo] = useState<{
     isBinaryManifest: boolean;
     isSignedApk: boolean;
+    signatureScheme?: string | null;
+    signerCertSha256?: string | null;
     sha256?: string | null;
     externalApkUrl?: string | null;
     viaBlob?: boolean;
   } | null>(null);
+  const [downloadHistory, setDownloadHistory] = useState<Record<string, DownloadedAppRecord>>(() =>
+    getDownloadedAppsMap()
+  );
   const [showQrPanel, setShowQrPanel] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const [copiedShare, setCopiedShare] = useState(false);
@@ -95,6 +109,16 @@ export function AppDetailView({
   const [helpfulVoted, setHelpfulVoted] = useState<Record<string, boolean>>({});
 
   const permanentAppUrl = `${window.location.origin}${window.location.pathname}?app=${encodeURIComponent(app.id)}`;
+
+  useEffect(() => {
+    const refreshHistory = () => setDownloadHistory(getDownloadedAppsMap());
+    window.addEventListener(INSTALL_HISTORY_EVENT, refreshHistory);
+    window.addEventListener('storage', refreshHistory);
+    return () => {
+      window.removeEventListener(INSTALL_HISTORY_EVENT, refreshHistory);
+      window.removeEventListener('storage', refreshHistory);
+    };
+  }, []);
 
   useEffect(() => {
     setInstallPhase('idle');
@@ -149,6 +173,7 @@ export function AppDetailView({
     let verified = false;
 
     let resolvedExternalUrl: string | null = null;
+    let resolvedSha256: string | null = app.apkSha256 || null;
 
     try {
       const verifyRes = await fetch(`./api/apps/${encodeURIComponent(app.id)}/verify-apk`);
@@ -164,6 +189,8 @@ export function AppDetailView({
           valid: boolean;
           isBinaryManifest: boolean;
           isSignedApk: boolean;
+          signatureScheme?: string | null;
+          signerCertSha256?: string | null;
           sha256?: string | null;
           externalApkUrl?: string | null;
           hasCustomApk?: boolean;
@@ -174,10 +201,13 @@ export function AppDetailView({
           return;
         }
         resolvedExternalUrl = !vData.hasCustomApk && vData.externalApkUrl ? vData.externalApkUrl : null;
+        resolvedSha256 = vData.sha256 || app.apkSha256 || null;
         setApkCheckInfo({
           isBinaryManifest: Boolean(vData.isBinaryManifest),
           isSignedApk: Boolean(vData.isSignedApk),
-          sha256: vData.sha256 || app.apkSha256 || null,
+          signatureScheme: vData.signatureScheme || app.signatureScheme || null,
+          signerCertSha256: vData.signerCertSha256 || app.signerCertSha256 || null,
+          sha256: resolvedSha256,
           externalApkUrl: vData.externalApkUrl || app.externalApkUrl || null,
           viaBlob: false,
         });
@@ -195,10 +225,13 @@ export function AppDetailView({
         return;
       }
       resolvedExternalUrl = localCheck.externalApkUrl || null;
+      resolvedSha256 = localCheck.sha256 || app.apkSha256 || null;
       setApkCheckInfo({
         isBinaryManifest: localCheck.isBinaryManifest,
         isSignedApk: localCheck.isSignedApk,
-        sha256: localCheck.sha256 || app.apkSha256 || null,
+        signatureScheme: localCheck.signatureScheme || app.signatureScheme || null,
+        signerCertSha256: app.signerCertSha256 || null,
+        sha256: resolvedSha256,
         externalApkUrl: resolvedExternalUrl,
         viaBlob: !resolvedExternalUrl,
       });
@@ -265,6 +298,8 @@ export function AppDetailView({
       document.body.removeChild(link);
       window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
     }
+
+    recordAppDownload(app, resolvedSha256);
 
     const isAndroid = /android/i.test(navigator.userAgent);
     if (!isAndroid) {
@@ -422,6 +457,9 @@ export function AppDetailView({
   };
 
   const totalDist = Math.max(app.reviewCount, 1);
+  const downloadInfo = getAppDownloadInfo(app, downloadHistory);
+  const hasNewUpdate = downloadInfo.status === 'update';
+  const alreadyInstalledLatest = downloadInfo.status === 'installed';
 
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-10">
@@ -518,7 +556,13 @@ export function AppDetailView({
             type="button"
             onClick={handleDirectInstall}
             disabled={installPhase === 'verifying'}
-            className="w-full inline-flex items-center justify-center gap-2.5 px-7 py-3.5 text-sm font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] disabled:opacity-80 rounded-xl transition-colors shadow-xs focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#01875F]"
+            className={`w-full inline-flex items-center justify-center gap-2.5 px-7 py-3.5 text-sm font-semibold rounded-xl transition-colors shadow-xs disabled:opacity-80 focus-visible:outline-2 focus-visible:outline-offset-2 ${
+              hasNewUpdate
+                ? 'bg-[#0B57D0] hover:bg-[#0842A0] text-white focus-visible:outline-[#0B57D0]'
+                : alreadyInstalledLatest && installPhase !== 'handoff'
+                ? 'bg-[#E6F4EA] hover:bg-[#D5ECD9] text-[#01875F] border border-[#01875F]/25 focus-visible:outline-[#01875F]'
+                : 'bg-[#01875F] hover:bg-[#016E4D] text-white focus-visible:outline-[#01875F]'
+            }`}
           >
             {installPhase === 'verifying' ? (
               <>
@@ -527,16 +571,35 @@ export function AppDetailView({
               </>
             ) : installPhase === 'handoff' ? (
               <>
-                <Download className="w-4 h-4" />
-                <span>تثبيت التطبيق (فتح حزمة APK مجدداً)</span>
+                {hasNewUpdate ? <RefreshCw className="w-4 h-4" /> : <Download className="w-4 h-4" />}
+                <span>تنزيل حزمة APK مجدداً</span>
+              </>
+            ) : hasNewUpdate ? (
+              <>
+                <RefreshCw className="w-4 h-4" />
+                <span>تحديث (v{app.versionName})</span>
+              </>
+            ) : alreadyInstalledLatest ? (
+              <>
+                <CheckCircle2 className="w-4 h-4" />
+                <span>تم التنزيل — إعادة تنزيل</span>
               </>
             ) : (
               <>
                 <Download className="w-4 h-4" />
-                <span>تثبيت التطبيق</span>
+                <span>تنزيل التطبيق</span>
               </>
             )}
           </button>
+
+          {hasNewUpdate && downloadInfo.previousRecord && (
+            <p className="text-[11px] font-medium text-[#0B57D0] bg-[#E8F0FE] border border-[#0B57D0]/20 rounded-lg px-3 py-1.5 w-full text-center">
+              يتوفر تحديث جديد منذ آخر تنزيل لك: لديك{' '}
+              <span dir="ltr" className="font-mono font-bold">v{downloadInfo.previousRecord.versionName}</span>
+              {' ← '}
+              <span dir="ltr" className="font-mono font-bold">v{app.versionName}</span>
+            </p>
+          )}
 
           <div className="flex items-center gap-2 w-full">
             <button
@@ -615,12 +678,17 @@ export function AppDetailView({
                     <p className="text-xs text-[#01875F] font-medium">
                       تم التحقق من سلامة بنية APK بنجاح
                       {apkCheckInfo.isSignedApk
-                        ? ' · حزمة موقّعة رقمياً'
+                        ? ` · حزمة موقّعة رقمياً (${apkCheckInfo.signatureScheme || 'APK Signature'})`
                         : ' · تنبيه: لم يُرصد توقيع رقمي داخل الحزمة'}
                     </p>
                     {apkCheckInfo.sha256 && (
                       <p className="text-[11px] font-mono text-[#5F6368] break-all" dir="ltr">
                         SHA-256: {apkCheckInfo.sha256}
+                      </p>
+                    )}
+                    {apkCheckInfo.signerCertSha256 && (
+                      <p className="text-[11px] font-mono text-[#5F6368] break-all" dir="ltr">
+                        Signer Cert SHA-256: {apkCheckInfo.signerCertSha256}
                       </p>
                     )}
                   </div>
@@ -783,9 +851,19 @@ export function AppDetailView({
             <div className="flex items-center justify-between gap-4 py-1.5 border-b border-[#E8EAED]">
               <dt className="text-[#5F6368]">حالة التوقيع</dt>
               <dd className={app.isSignedApk ? 'text-[#01875F] font-semibold text-xs' : 'text-[#5F6368] text-xs'}>
-                {app.isSignedApk ? 'موقّعة رقمياً' : 'قياسية'}
+                {app.isSignedApk
+                  ? `موقّعة رقمياً (${app.signatureScheme || 'APK'})`
+                  : 'موقّعة عند التنزيل (v1)'}
               </dd>
             </div>
+            {app.signerCertSha256 && (
+              <div className="py-1.5 border-b border-[#E8EAED] space-y-1">
+                <dt className="text-[#5F6368]">بصمة شهادة التوقيع</dt>
+                <dd className="font-mono text-[11px] text-[#202124] break-all" dir="ltr">
+                  {app.signerCertSha256}
+                </dd>
+              </div>
+            )}
             {app.apkSha256 && (
               <div className="py-1.5 border-b border-[#E8EAED] space-y-1">
                 <dt className="text-[#5F6368]">بصمة التحقق (SHA-256)</dt>

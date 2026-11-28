@@ -124,6 +124,7 @@ export function UploadStudioView({
   const [minAndroid, setMinAndroid] = useState('Android 8.0+');
   const [ageRating, setAgeRating] = useState('+3');
   const [externalApkUrl, setExternalApkUrl] = useState('');
+  const [autoSignUnsigned, setAutoSignUnsigned] = useState(true);
 
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
@@ -403,6 +404,7 @@ export function UploadStudioView({
     formData.append('minAndroid', minAndroid.trim() || editingApp?.minAndroid || 'Android 8.0+');
     formData.append('ageRating', ageRating);
     formData.append('externalApkUrl', trimmedExternalUrl);
+    formData.append('autoSignUnsigned', autoSignUnsigned ? 'true' : 'false');
     if (extracted) {
       formData.append('sizeMB', String(extracted.sizeMB || 1));
       formData.append('permissionsCount', String(extracted.permissionsCount || 0));
@@ -444,6 +446,7 @@ export function UploadStudioView({
               sizeMB: extracted?.sizeMB,
               isBinaryManifest: extracted?.isBinaryManifest,
               isSignedApk: extracted?.isSignedApk,
+              signatureScheme: extracted?.signatureScheme,
               apkSha256: extracted?.apkSha256,
               externalApkUrl: trimmedExternalUrl,
               permissionsCount: extracted?.permissionsCount,
@@ -467,6 +470,7 @@ export function UploadStudioView({
               sizeMB: extracted?.sizeMB || 1,
               isBinaryManifest: extracted?.isBinaryManifest,
               isSignedApk: extracted?.isSignedApk,
+              signatureScheme: extracted?.signatureScheme,
               apkSha256: extracted?.apkSha256,
               externalApkUrl: trimmedExternalUrl || undefined,
               permissionsCount: extracted?.permissionsCount || 0,
@@ -1117,13 +1121,29 @@ export function UploadStudioView({
                           {extracted?.minAndroid}
                         </p>
                         {extracted?.isValidZipApk && (
-                          <div className="space-y-0.5 pt-1">
+                          <div className="space-y-1.5 pt-1">
                             <p className={extracted.isSignedApk ? 'text-[#01875F] font-medium' : 'text-amber-700 font-medium'}>
                               حزمة APK سليمة ومكتملة
                               {extracted.isSignedApk
-                                ? ' · موقّعة رقمياً (Android Signature)'
-                                : ' · تنبيه: الحزمة غير موقّعة رقمياً (قد يرفضها Android)'}
+                                ? ` · موقّعة رقمياً (${extracted.signatureScheme || 'Android Signature'}) — سيُحفظ توقيعك الأصلي كما هو`
+                                : ' · الحزمة غير موقّعة رقمياً بعد'}
                             </p>
+                            {!extracted.isSignedApk && (
+                              <label className="flex items-start gap-2 p-2.5 bg-white border border-amber-200 rounded-xl text-[11px] text-[#3C4043] cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={autoSignUnsigned}
+                                  onChange={(e) => setAutoSignUnsigned(e.target.checked)}
+                                  className="mt-0.5 accent-[#01875F]"
+                                />
+                                <span>
+                                  <strong>توقيع الحزمة تلقائياً على الخادم بمفتاح Play55 (RSA-2048 v1)</strong> ليقبلها مُثبّت Android.
+                                  <span className="block text-[#5F6368] mt-0.5">
+                                    ملاحظة تقنية: أندرويد لا يعتمد شهادات موثوقة عالمياً لملفات APK؛ لذا يزول تنبيه Chrome تدريجياً مع استقرار النطاق والسمعة عبر HTTPS وليس عبر التوقيع وحده.
+                                  </span>
+                                </span>
+                              </label>
+                            )}
                             {extracted.apkSha256 && (
                               <p className="font-mono text-[11px] text-[#5F6368] break-all" dir="ltr">
                                 SHA-256: {extracted.apkSha256}

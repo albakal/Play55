@@ -4,6 +4,7 @@ import {
   ArrowUpLeft,
   CheckCircle2,
   Download,
+  RefreshCw,
   Search,
   Star,
   Upload,
@@ -37,6 +38,13 @@ import {
   localSaveSession,
   localVerifyApkBlob,
 } from './utils/localStoreEngine.ts';
+import {
+  getAppDownloadInfo,
+  getDownloadedAppsMap,
+  INSTALL_HISTORY_EVENT,
+  recordAppDownload,
+} from './utils/installHistory.ts';
+import type { DownloadedAppRecord } from './utils/installHistory.ts';
 import { StoreHeader } from './components/StoreHeader.tsx';
 import type { NavTab } from './components/StoreHeader.tsx';
 import { AppIcon } from './components/AppIcon.tsx';
@@ -80,6 +88,9 @@ export default function App() {
   const [quickInstallingId, setQuickInstallingId] = useState<string | null>(null);
   const [quickInstalledId, setQuickInstalledId] = useState<string | null>(null);
   const [quickInstallError, setQuickInstallError] = useState<string | null>(null);
+  const [downloadHistory, setDownloadHistory] = useState<Record<string, DownloadedAppRecord>>(() =>
+    getDownloadedAppsMap()
+  );
 
   const [editingApp, setEditingApp] = useState<StoreApp | null>(null);
 
@@ -87,6 +98,16 @@ export default function App() {
   const [manualToken, setManualToken] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const refreshHistory = () => setDownloadHistory(getDownloadedAppsMap());
+    window.addEventListener(INSTALL_HISTORY_EVENT, refreshHistory);
+    window.addEventListener('storage', refreshHistory);
+    return () => {
+      window.removeEventListener(INSTALL_HISTORY_EVENT, refreshHistory);
+      window.removeEventListener('storage', refreshHistory);
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -439,18 +460,20 @@ export default function App() {
 
     let backendOnline = false;
     let verified = false;
+    let resolvedSha256: string | null = app.apkSha256 || null;
 
     try {
       const vRes = await fetch(`./api/apps/${encodeURIComponent(app.id)}/verify-apk`);
       const vCt = vRes.headers.get('content-type') || '';
       if (vCt.includes('application/json')) {
         backendOnline = true;
-        const vData = (await vRes.json()) as { valid?: boolean };
+        const vData = (await vRes.json()) as { valid?: boolean; sha256?: string | null };
         if (!vRes.ok || !vData.valid) {
           setQuickInstallingId(null);
           setQuickInstallError(`تعذر تثبيت «${app.name}»: ملف APK تالف أو غير مكتمل.`);
           return;
         }
+        resolvedSha256 = vData.sha256 || resolvedSha256;
         verified = true;
       }
     } catch {
@@ -465,6 +488,7 @@ export default function App() {
         setQuickInstallError(`تعذر تثبيت «${app.name}»: ملف APK تالف أو غير مكتمل.`);
         return;
       }
+      resolvedSha256 = localCheck.sha256 || resolvedSha256;
       resolvedExternalUrl = localCheck.externalApkUrl || null;
       verified = true;
     }
@@ -521,10 +545,12 @@ export default function App() {
       window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
     }
 
+    recordAppDownload(app, resolvedSha256);
+
     window.setTimeout(() => {
       setQuickInstallingId(null);
       setQuickInstalledId(app.id);
-      window.setTimeout(() => setQuickInstalledId(null), 3000);
+      window.setTimeout(() => setQuickInstalledId(null), 2500);
     }, 450);
   };
 
@@ -762,21 +788,44 @@ export default function App() {
                     </div>
 
                     <div className="flex flex-wrap items-center gap-3">
-                      <button
-                        type="button"
-                        onClick={() => void handleQuickInstall(featuredApp)}
-                        disabled={quickInstallingId === featuredApp.id}
-                        className="inline-flex items-center gap-2 px-6 py-3 text-sm font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] disabled:opacity-75 rounded-xl transition-colors whitespace-nowrap"
-                      >
-                        <Download className="w-4 h-4" />
-                        <span>
-                          {quickInstallingId === featuredApp.id
-                            ? 'جاري تجهيز APK...'
-                            : quickInstalledId === featuredApp.id
-                            ? 'تم تجهيز الحزمة لنظام Android'
-                            : 'تثبيت التطبيق'}
-                        </span>
-                      </button>
+                      {(() => {
+                        const heroDl = getAppDownloadInfo(featuredApp, downloadHistory);
+                        const isHeroUpdate = heroDl.status === 'update';
+                        const isHeroInstalled = heroDl.status === 'installed';
+                        return (
+                          <button
+                            type="button"
+                            onClick={() => void handleQuickInstall(featuredApp)}
+                            disabled={quickInstallingId === featuredApp.id}
+                            className={`inline-flex items-center gap-2 px-6 py-3 text-sm font-semibold rounded-xl transition-colors whitespace-nowrap disabled:opacity-75 ${
+                              isHeroUpdate
+                                ? 'bg-[#0B57D0] hover:bg-[#0842A0] text-white'
+                                : isHeroInstalled && quickInstalledId !== featuredApp.id
+                                ? 'bg-[#E6F4EA] hover:bg-[#D5ECD9] text-[#01875F]'
+                                : 'bg-[#01875F] hover:bg-[#016E4D] text-white'
+                            }`}
+                          >
+                            {isHeroUpdate ? (
+                              <RefreshCw className="w-4 h-4" />
+                            ) : isHeroInstalled && quickInstalledId !== featuredApp.id ? (
+                              <CheckCircle2 className="w-4 h-4" />
+                            ) : (
+                              <Download className="w-4 h-4" />
+                            )}
+                            <span>
+                              {quickInstallingId === featuredApp.id
+                                ? 'جاري تجهيز APK...'
+                                : quickInstalledId === featuredApp.id
+                                ? 'تم بدء التنزيل لنظام Android'
+                                : isHeroUpdate
+                                ? `تحديث (v${featuredApp.versionName})`
+                                : isHeroInstalled
+                                ? 'إعادة تنزيل'
+                                : 'تنزيل التطبيق'}
+                            </span>
+                          </button>
+                        );
+                      })()}
 
                       <button
                         type="button"
@@ -877,7 +926,10 @@ export default function App() {
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
                   {filteredApps.map((app) => {
                     const isInstalling = quickInstallingId === app.id;
-                    const isInstalled = quickInstalledId === app.id;
+                    const isInstalledNow = quickInstalledId === app.id;
+                    const dlInfo = getAppDownloadInfo(app, downloadHistory);
+                    const hasUpdate = dlInfo.status === 'update';
+                    const alreadyDownloaded = dlInfo.status === 'installed';
 
                     return (
                       <article
@@ -903,9 +955,16 @@ export default function App() {
                               className="w-16 h-16 rounded-2xl"
                             />
                             <div className="min-w-0 flex-1 space-y-1">
-                              <h3 className="font-display text-base font-bold text-[#202124] truncate group-hover:text-[#01875F] transition-colors">
-                                {app.name}
-                              </h3>
+                              <div className="flex items-center justify-between gap-2">
+                                <h3 className="font-display text-base font-bold text-[#202124] truncate group-hover:text-[#01875F] transition-colors">
+                                  {app.name}
+                                </h3>
+                                {hasUpdate && (
+                                  <span className="shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-md bg-[#E8F0FE] text-[#0B57D0]">
+                                    تحديث متاح
+                                  </span>
+                                )}
+                              </div>
                               <div className="flex items-center gap-1.5 text-xs text-[#5F6368] truncate">
                                 <span className="truncate">{app.developer}</span>
                                 <span aria-hidden="true">·</span>
@@ -943,22 +1002,36 @@ export default function App() {
                             onClick={() => void handleQuickInstall(app)}
                             disabled={isInstalling}
                             className={`inline-flex items-center gap-1.5 px-4 py-1.5 text-xs font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 ${
-                              isInstalled
+                              isInstalledNow
                                 ? 'bg-[#E6F4EA] text-[#01875F]'
+                                : hasUpdate
+                                ? 'bg-[#0B57D0] hover:bg-[#0842A0] text-white'
+                                : alreadyDownloaded
+                                ? 'bg-[#E6F4EA] hover:bg-[#D5ECD9] text-[#01875F]'
                                 : 'bg-[#01875F] hover:bg-[#016E4D] text-white'
                             }`}
                           >
-                            {isInstalled ? (
+                            {isInstalledNow ? (
                               <>
                                 <CheckCircle2 className="w-3.5 h-3.5" />
-                                <span>تم تجهيز الحزمة</span>
+                                <span>تم التنزيل</span>
                               </>
                             ) : isInstalling ? (
                               <span>جاري التجهيز...</span>
+                            ) : hasUpdate ? (
+                              <>
+                                <RefreshCw className="w-3.5 h-3.5" />
+                                <span>تحديث</span>
+                              </>
+                            ) : alreadyDownloaded ? (
+                              <>
+                                <CheckCircle2 className="w-3.5 h-3.5" />
+                                <span>إعادة تنزيل</span>
+                              </>
                             ) : (
                               <>
                                 <Download className="w-3.5 h-3.5" />
-                                <span>تثبيت التطبيق</span>
+                                <span>تنزيل</span>
                               </>
                             )}
                           </button>
