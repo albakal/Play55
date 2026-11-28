@@ -15,6 +15,7 @@ import {
   Mail,
   Package,
   RefreshCw,
+  Share2,
   ShieldCheck,
   Sparkles,
   Upload,
@@ -41,13 +42,18 @@ import {
   localPublishApp,
   localUpdateApp,
 } from '../utils/localStoreEngine.ts';
-import { buildPermanentAppShareUrl } from '../utils/shareLink.ts';
+import {
+  buildCompressedShortShareUrl,
+  buildPermanentAppShareUrl,
+} from '../utils/shareLink.ts';
+import { shareShortLinkWithAppImage } from '../utils/shareWithImage.ts';
 import { AppIcon } from './AppIcon.tsx';
 
 interface UploadStudioViewProps {
   user: DeveloperSessionUser | null;
   apps: StoreApp[];
   editingApp: StoreApp | null;
+  serverOnline?: boolean;
   authLoading: boolean;
   authError: string | null;
   onManualAuth: (params: {
@@ -95,6 +101,7 @@ export function UploadStudioView({
   user,
   apps,
   editingApp,
+  serverOnline = false,
   authLoading,
   authError,
   onManualAuth,
@@ -153,6 +160,7 @@ export function UploadStudioView({
     cloudSyncWarning?: string;
   } | null>(null);
   const [copiedAppId, setCopiedAppId] = useState<string | null>(null);
+  const [sharedStatus, setSharedStatus] = useState<{ id: string; text: string } | null>(null);
 
   useEffect(() => {
     if (user?.displayName && !developer.trim() && !editingApp) {
@@ -186,15 +194,42 @@ export function UploadStudioView({
     }
   }, [editingApp]);
 
+  const resolveShortUrlForApp = async (targetApp: StoreApp): Promise<string> => {
+    return buildCompressedShortShareUrl(targetApp, {
+      preferPathShortLink: serverOnline || Boolean(targetApp.serverSynced),
+      serverOnline,
+    });
+  };
+
   const handleCopyAppLink = async (targetApp: StoreApp) => {
     try {
-      await navigator.clipboard.writeText(buildPermanentAppShareUrl(targetApp));
+      const shortUrl = await resolveShortUrlForApp(targetApp);
+      await navigator.clipboard.writeText(shortUrl);
       setCopiedAppId(targetApp.id);
       window.setTimeout(() => {
         setCopiedAppId((prev) => (prev === targetApp.id ? null : prev));
       }, 2500);
     } catch {
       setCopiedAppId(null);
+    }
+  };
+
+  const handleShareAppWithImage = async (targetApp: StoreApp, explicitUrl?: string) => {
+    try {
+      const urlToShare = explicitUrl || (await resolveShortUrlForApp(targetApp));
+      const outcome = await shareShortLinkWithAppImage(targetApp, urlToShare);
+      const message =
+        outcome === 'shared-with-image'
+          ? 'تمت مشاركة الرابط القصير مع الصورة'
+          : outcome === 'shared-link'
+          ? 'تمت مشاركة الرابط القصير'
+          : 'تم نسخ الرابط القصير';
+      setSharedStatus({ id: targetApp.id, text: message });
+      window.setTimeout(() => {
+        setSharedStatus((prev) => (prev?.id === targetApp.id ? null : prev));
+      }, 2500);
+    } catch {
+      // User cancelled share sheet
     }
   };
 
@@ -429,9 +464,11 @@ export function UploadStudioView({
     setUploading(true);
     setUploadProgress(0);
 
-    const finalizeSave = async (savedApp: StoreApp, _fromServer: boolean) => {
+    const finalizeSave = async (savedApp: StoreApp, fromServer: boolean) => {
       let workingApp: StoreApp = { ...savedApp };
       let syncedToCloud = Boolean(savedApp.syncedToCloud);
+      let serverSynced = fromServer || Boolean(savedApp.serverSynced) || serverOnline;
+      let resolvedShortCode = savedApp.shortCode;
       let cloudSyncWarning: string | undefined;
 
       // Always prefer direct compressed File/Blob sources over ephemeral ./uploads/... paths
@@ -483,6 +520,7 @@ export function UploadStudioView({
           if (cloudResult.ok && cloudResult.syncedApp) {
             syncedToCloud = true;
             workingApp = cloudResult.syncedApp;
+            resolvedShortCode = cloudResult.syncedApp.shortCode || resolvedShortCode;
             await localMarkAppSynced(savedApp.id, true, {
               iconUrl: workingApp.iconUrl,
               screenshots: workingApp.screenshots,
@@ -510,13 +548,61 @@ export function UploadStudioView({
         };
       }
 
+      if (fromServer || serverOnline) {
+        try {
+          const shortIcon =
+            (await compressImageDataUrlForCloud(workingApp.iconUrl || candidateIconUrl, 85_000, 256)) ||
+            workingApp.iconUrl;
+          const shortPreview = workingApp.screenshots?.[0]
+            ? await compressImageDataUrlForCloud(workingApp.screenshots[0], 95_000, 512)
+            : undefined;
+          const shortHeaders: Record<string, string> = {
+            'Content-Type': 'application/json',
+            'X-Requested-With': 'Play55',
+          };
+          if (idToken) {
+            shortHeaders['Authorization'] = `Bearer ${idToken}`;
+          }
+          const slRes = await fetch('./api/short-links', {
+            method: 'POST',
+            credentials: 'include',
+            headers: shortHeaders,
+            body: JSON.stringify({
+              appId: workingApp.id,
+              appName: workingApp.name,
+              developer: workingApp.developer,
+              shortDescription: workingApp.shortDescription,
+              versionName: workingApp.versionName,
+              iconUrl: shortIcon,
+              previewImageUrl: shortPreview || undefined,
+            }),
+          });
+          const slCt = slRes.headers.get('content-type') || '';
+          if (slRes.ok && slCt.includes('application/json')) {
+            const slData = (await slRes.json()) as { code?: string };
+            if (slData.code) resolvedShortCode = slData.code;
+            serverSynced = true;
+          }
+        } catch {
+          // Keep existing serverSynced state
+        }
+      }
+
       const finalApp: StoreApp = {
         ...workingApp,
+        shortCode: resolvedShortCode,
+        serverSynced,
         syncedToCloud,
       };
 
-      let shareUrl = buildPermanentAppShareUrl(finalApp);
-      if (!syncedToCloud) {
+      const isShareHosted = syncedToCloud || serverSynced;
+      let shareUrl: string;
+      if (isShareHosted) {
+        shareUrl = await buildCompressedShortShareUrl(finalApp, {
+          preferPathShortLink: serverSynced,
+          serverOnline: serverSynced,
+        });
+      } else {
         const compactIcon =
           (await compressImageDataUrlForCloud(finalApp.iconUrl, 11_000, 128)) || '';
         const compactShots: string[] = [];
@@ -524,11 +610,14 @@ export function UploadStudioView({
           const cs = await compressImageDataUrlForCloud(s, 9_500, 360);
           if (cs) compactShots.push(cs);
         }
-        shareUrl = buildPermanentAppShareUrl({
-          ...finalApp,
-          iconUrl: compactIcon || finalApp.iconUrl,
-          screenshots: compactShots,
-        });
+        shareUrl = await buildCompressedShortShareUrl(
+          {
+            ...finalApp,
+            iconUrl: compactIcon || finalApp.iconUrl,
+            screenshots: compactShots,
+          },
+          { preferPathShortLink: false, serverOnline: false }
+        );
       }
 
       setUploadProgress(100);
@@ -893,7 +982,7 @@ export function UploadStudioView({
         </button>
       </div>
 
-      {/* Post-Publish / Post-Update Permanent App Link Banner */}
+      {/* Post-Publish / Post-Update Short Link With Embedded App Image Banner */}
       {lastSavedBanner && (
         <section className="p-5 bg-[#E6F4EA] border border-[#01875F]/30 rounded-2xl space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -901,8 +990,8 @@ export function UploadStudioView({
               <CheckCircle2 className="w-5 h-5 shrink-0" />
               <span>
                 {lastSavedBanner.isUpdate
-                  ? `تم تحديث تطبيق «${lastSavedBanner.app.name}» إلى الإصدار v${lastSavedBanner.app.versionName} مع الحفاظ على نفس الرابط الدائم!`
-                  : `تم نشر تطبيق «${lastSavedBanner.app.name}» وإنشاء رابطه الخاص تلقائياً!`}
+                  ? `تم تحديث تطبيق «${lastSavedBanner.app.name}» إلى الإصدار v${lastSavedBanner.app.versionName} مع الحفاظ على نفس الرابط القصير!`
+                  : `تم نشر تطبيق «${lastSavedBanner.app.name}» وإنشاء رابطه القصير مع صورة التطبيق تلقائياً!`}
               </span>
             </div>
             <button
@@ -916,13 +1005,25 @@ export function UploadStudioView({
           </div>
 
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 bg-white border border-[#01875F]/20 rounded-xl">
-            <div className="flex items-center gap-2 min-w-0">
-              <Link2 className="w-4 h-4 text-[#01875F] shrink-0" />
-              <code className="text-xs font-mono text-[#202124] truncate" dir="ltr">
-                {lastSavedBanner.shareUrl}
-              </code>
+            <div className="flex items-center gap-3 min-w-0">
+              <AppIcon
+                src={lastSavedBanner.app.iconUrl}
+                alt={lastSavedBanner.app.name}
+                className="w-11 h-11 rounded-xl shrink-0"
+              />
+              <div className="min-w-0 space-y-0.5">
+                <p className="text-xs font-bold text-[#202124] truncate">
+                  {lastSavedBanner.app.name} · v{lastSavedBanner.app.versionName}
+                </p>
+                <div className="flex items-center gap-1.5 min-w-0">
+                  <Link2 className="w-3.5 h-3.5 text-[#01875F] shrink-0" />
+                  <code className="text-xs font-mono text-[#5F6368] truncate" dir="ltr">
+                    {lastSavedBanner.shareUrl}
+                  </code>
+                </div>
+              </div>
             </div>
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
               <button
                 type="button"
                 onClick={async () => {
@@ -939,7 +1040,21 @@ export function UploadStudioView({
                 className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#01875F] bg-[#E6F4EA] hover:bg-[#D5ECD9] rounded-lg transition-colors"
               >
                 <Copy className="w-3.5 h-3.5" />
-                <span>{copiedAppId === lastSavedBanner.app.id ? 'تم نسخ الرابط' : 'نسخ الرابط'}</span>
+                <span>{copiedAppId === lastSavedBanner.app.id ? 'تم نسخ الرابط' : 'نسخ الرابط القصير'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  void handleShareAppWithImage(lastSavedBanner.app, lastSavedBanner.shareUrl)
+                }
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#0B57D0] bg-[#E8F0FE] hover:bg-[#D2E3FC] rounded-lg transition-colors"
+              >
+                <Share2 className="w-3.5 h-3.5" />
+                <span>
+                  {sharedStatus?.id === lastSavedBanner.app.id
+                    ? sharedStatus.text
+                    : 'مشاركة مع الصورة'}
+                </span>
               </button>
               <button
                 type="button"
@@ -958,23 +1073,25 @@ export function UploadStudioView({
             </p>
           )}
 
-          {!lastSavedBanner.app.syncedToCloud && !lastSavedBanner.cloudSyncWarning && (
-            <p className="text-[11px] text-[#016E4D] leading-relaxed">
-              هذا الرابط يحتوي تلقائياً على بيانات التطبيق وصوره لكي يفتح صفحة تطبيقك لدى أي شخص ترسل له الرابط. وللربط السحابي الكامل برابط قصير وإتاحة التطبيق في الواجهة العامة للجميع، يمكنك تسجيل الدخول بحساب جوجل.
-            </p>
-          )}
+          {!lastSavedBanner.app.syncedToCloud &&
+            !lastSavedBanner.app.serverSynced &&
+            !lastSavedBanner.cloudSyncWarning && (
+              <p className="text-[11px] text-[#016E4D] leading-relaxed">
+                هذا الرابط المضغوط يضمّ صورة التطبيق وبياناته تلقائياً عند الإرسال. ولإنتاج رابط قصير للغاية (<code dir="ltr">?s=...</code>) مع معاينة صورة فورية في كل التطبيقات، سجّل الدخول بحساب جوجل.
+              </p>
+            )}
         </section>
       )}
 
-      {/* Developer Dashboard: My Published Apps & Independent Permanent Links */}
+      {/* Developer Dashboard: My Published Apps & Independent Short Links */}
       <section className="p-5 bg-white border border-[#E8EAED] rounded-2xl space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div>
             <h2 className="font-display text-lg font-bold text-[#202124]">
-              لوحة تحكم المطور — تطبيقاتي وروابطها الخاصة
+              لوحة تحكم المطور — تطبيقاتي وروابطها القصيرة
             </h2>
             <p className="text-xs text-[#5F6368]">
-              لكل تطبيق رابط دائم لا يتغير عند تحديث الإصدار؛ شاركه ليفتح الزوار صفحة تطبيقك مباشرة.
+              لكل تطبيق رابط قصير دائم مرفق بصورته لا يتغير عند تحديث الإصدار؛ شاركه ليظهر للمستلمين بالصورة ويفتح التطبيق مباشرة.
             </p>
           </div>
           <span className="text-xs font-semibold text-[#01875F] bg-[#E6F4EA] px-3 py-1 rounded-lg tabular-nums">
@@ -984,13 +1101,17 @@ export function UploadStudioView({
 
         {myApps.length === 0 ? (
           <p className="text-xs text-[#5F6368] py-4 text-center bg-[#F8F9FA] rounded-xl">
-            لم تنشر أي تطبيقات بعد. ارفع ملف APK في النموذج أدناه ليظهر رابطه الخاص هنا تلقائياً.
+            لم تنشر أي تطبيقات بعد. ارفع ملف APK في النموذج أدناه ليظهر رابطه القصير هنا تلقائياً.
           </p>
         ) : (
           <div className="divide-y divide-[#E8EAED]">
             {myApps.map((item) => {
-              const appLink = buildPermanentAppShareUrl(item);
+              const appLink = buildPermanentAppShareUrl(item, {
+                preferPathShortLink: serverOnline || Boolean(item.serverSynced),
+                serverOnline,
+              });
               const isEditingThis = editingApp?.id === item.id;
+              const isCloudOrServer = Boolean(item.syncedToCloud || item.serverSynced || serverOnline);
               return (
                 <div
                   key={item.id}
@@ -1013,12 +1134,12 @@ export function UploadStudioView({
                         </span>
                         <span
                           className={`text-[10px] font-semibold px-2 py-0.5 rounded-md ${
-                            item.syncedToCloud
+                            isCloudOrServer
                               ? 'bg-[#E6F4EA] text-[#01875F]'
                               : 'bg-amber-50 text-amber-700'
                           }`}
                         >
-                          {item.syncedToCloud ? 'متزامن سحابياً' : 'رابط ذاتي مضمّن'}
+                          {isCloudOrServer ? 'رابط قصير مع صورة' : 'رابط مضغوط بالصورة'}
                         </span>
                       </div>
                       <div className="flex items-center gap-1.5 text-xs text-[#5F6368] min-w-0">
@@ -1037,7 +1158,17 @@ export function UploadStudioView({
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-[#202124] bg-[#F8F9FA] hover:bg-[#F1F3F4] border border-[#DADCE0] rounded-lg transition-colors"
                     >
                       <Copy className="w-3.5 h-3.5 text-[#01875F]" />
-                      <span>{copiedAppId === item.id ? 'تم النسخ' : 'نسخ الرابط'}</span>
+                      <span>{copiedAppId === item.id ? 'تم النسخ' : 'نسخ القصير'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleShareAppWithImage(item)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-[#0B57D0] bg-[#E8F0FE] hover:bg-[#D2E3FC] border border-[#D2E3FC] rounded-lg transition-colors"
+                    >
+                      <Share2 className="w-3.5 h-3.5" />
+                      <span>
+                        {sharedStatus?.id === item.id ? sharedStatus.text : 'مشاركة مع الصورة'}
+                      </span>
                     </button>
                     <button
                       type="button"

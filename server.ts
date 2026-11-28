@@ -6,7 +6,7 @@ import multer from 'multer';
 import JSZip from 'jszip';
 import { getApp, getApps, initializeApp } from 'firebase-admin/app';
 import { getAuth as getAdminAuth } from 'firebase-admin/auth';
-import type { AppCategory, ReviewItem, StoreApp } from './src/types.ts';
+import type { AppCategory, ReviewItem, ShortLinkRecord, StoreApp } from './src/types.ts';
 import {
   inspectApkSignatureDetails,
   signUnsignedApkBuffer,
@@ -437,6 +437,62 @@ async function inspectApkBuffer(buffer: Buffer): Promise<ApkInspectionResult> {
 interface StoreDatabase {
   apps: StoreApp[];
   reviews: ReviewItem[];
+  shortLinks?: ShortLinkRecord[];
+}
+
+function generateShortCodeForAppId(appId: string): string {
+  const clean = appId.trim() || 'app';
+  let h1 = 0x811c9dc5;
+  let h2 = 0x9e3779b9;
+  for (let i = 0; i < clean.length; i++) {
+    const ch = clean.charCodeAt(i);
+    h1 ^= ch;
+    h1 = Math.imul(h1, 0x01000193) >>> 0;
+    h2 = (Math.imul(h2 ^ ch, 0x85ebca6b) + i) >>> 0;
+  }
+  const part1 = h1.toString(36).padStart(4, '0').slice(0, 4);
+  const part2 = h2.toString(36).padStart(3, '0').slice(0, 3);
+  return `p${part1}${part2}`.slice(0, 8);
+}
+
+function upsertServerShortLink(database: StoreDatabase, storeApp: StoreApp, overrideIcon?: string): ShortLinkRecord {
+  if (!Array.isArray(database.shortLinks)) {
+    database.shortLinks = [];
+  }
+  const code = storeApp.shortCode || generateShortCodeForAppId(storeApp.id);
+  storeApp.shortCode = code;
+  const now = new Date().toISOString();
+  const existing = database.shortLinks.find((s) => s.code === code || s.appId === storeApp.id);
+  const iconUrl = (overrideIcon && overrideIcon.trim()) || storeApp.iconUrl || './media/store/brand_nabd.svg';
+  const previewImageUrl = storeApp.screenshots?.[0] || existing?.previewImageUrl;
+  if (existing) {
+    existing.code = code;
+    existing.appId = storeApp.id;
+    existing.appName = storeApp.name;
+    existing.developer = storeApp.developer;
+    existing.shortDescription = storeApp.shortDescription;
+    existing.versionName = storeApp.versionName;
+    existing.iconUrl = iconUrl;
+    if (previewImageUrl) existing.previewImageUrl = previewImageUrl;
+    existing.ownerUid = storeApp.ownerUid;
+    existing.updatedAt = now;
+    return existing;
+  }
+  const rec: ShortLinkRecord = {
+    code,
+    appId: storeApp.id,
+    appName: storeApp.name,
+    developer: storeApp.developer,
+    shortDescription: storeApp.shortDescription,
+    versionName: storeApp.versionName,
+    iconUrl,
+    ...(previewImageUrl ? { previewImageUrl } : {}),
+    ownerUid: storeApp.ownerUid,
+    createdAt: storeApp.createdAt || now,
+    updatedAt: now,
+  };
+  database.shortLinks.unshift(rec);
+  return rec;
 }
 
 function computeRatingStats(reviews: ReviewItem[]) {
@@ -801,7 +857,24 @@ function buildInitialSeed(): StoreDatabase {
     app.ratingDistribution = stats.ratingDistribution;
   }
 
-  return { apps, reviews };
+  const shortLinks: ShortLinkRecord[] = apps.map((a) => {
+    const code = generateShortCodeForAppId(a.id);
+    a.shortCode = code;
+    return {
+      code,
+      appId: a.id,
+      appName: a.name,
+      developer: a.developer,
+      shortDescription: a.shortDescription,
+      versionName: a.versionName,
+      iconUrl: a.iconUrl,
+      ...(a.screenshots?.[0] ? { previewImageUrl: a.screenshots[0] } : {}),
+      createdAt: a.createdAt,
+      updatedAt: a.updatedAt,
+    };
+  });
+
+  return { apps, reviews, shortLinks };
 }
 
 function loadStore(): StoreDatabase {
@@ -815,6 +888,24 @@ function loadStore(): StoreDatabase {
     const parsed = JSON.parse(raw) as StoreDatabase;
     if (!Array.isArray(parsed.apps) || !Array.isArray(parsed.reviews)) {
       throw new Error('Invalid store format');
+    }
+    let dirty = false;
+    if (!Array.isArray(parsed.shortLinks)) {
+      parsed.shortLinks = [];
+      dirty = true;
+    }
+    for (const item of parsed.apps) {
+      if (!item.shortCode) {
+        item.shortCode = generateShortCodeForAppId(item.id);
+        dirty = true;
+      }
+      if (!parsed.shortLinks.some((s) => s.appId === item.id)) {
+        upsertServerShortLink(parsed, item);
+        dirty = true;
+      }
+    }
+    if (dirty) {
+      fs.writeFileSync(STORE_FILE, JSON.stringify(parsed, null, 2), 'utf8');
     }
     return parsed;
   } catch {
@@ -1259,13 +1350,16 @@ async function startServer() {
           reviewCount: 0,
           ratingDistribution: { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 },
           featured: false,
+          serverSynced: true,
           ownerUid: (res.locals.developerUser as VerifiedDeveloper).uid,
           ownerEmail: (res.locals.developerUser as VerifiedDeveloper).email,
           createdAt: now,
           updatedAt: now,
         };
+        newApp.shortCode = generateShortCodeForAppId(newApp.id);
 
         db.apps.unshift(newApp);
+        upsertServerShortLink(db, newApp);
         await saveStore(db);
 
         res.status(201).json({ app: newApp });
@@ -1433,8 +1527,11 @@ async function startServer() {
         target.apkSha256 = nextSha256;
         target.externalApkUrl = nextExternalUrl;
         target.permissionsCount = nextPermissionsCount;
+        target.serverSynced = true;
+        target.shortCode = target.shortCode || generateShortCodeForAppId(target.id);
         target.updatedAt = new Date().toISOString();
 
+        upsertServerShortLink(db, target);
         await saveStore(db);
         res.json({ app: target });
       } catch (err) {
@@ -1509,8 +1606,9 @@ async function startServer() {
     }
 
     const downloadFilename = `${safeSlug(found.packageName)}-v${safeSlug(found.versionName)}.apk`;
+    const dispositionMode = req.query.mode === 'open' ? 'inline' : 'attachment';
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-    res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
+    res.setHeader('Content-Disposition', `${dispositionMode}; filename="${downloadFilename}"`);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Cache-Control', 'public, max-age=300');
@@ -1629,6 +1727,9 @@ async function startServer() {
 
     const [removed] = db.apps.splice(idx, 1);
     db.reviews = db.reviews.filter((r) => r.appId !== removed.id);
+    if (Array.isArray(db.shortLinks)) {
+      db.shortLinks = db.shortLinks.filter((s) => s.appId !== removed.id);
+    }
 
     if (removed.hasCustomApk && removed.apkFilename) {
       const resolvedApk = path.resolve(APKS_DIR, path.basename(removed.apkFilename));
@@ -1641,24 +1742,352 @@ async function startServer() {
     res.json({ deleted: true });
   });
 
+  // Short link registration & lookup (for manual-auth & server apps alike)
+  app.post('/api/short-links', async (req, res) => {
+    const body = req.body as {
+      appId?: unknown;
+      appName?: unknown;
+      developer?: unknown;
+      shortDescription?: unknown;
+      versionName?: unknown;
+      iconUrl?: unknown;
+      previewImageUrl?: unknown;
+    };
+    const appId = typeof body.appId === 'string' ? body.appId.trim() : '';
+    if (!appId || !/^[a-zA-Z0-9_-]{1,128}$/.test(appId)) {
+      res.status(400).json({ error: 'معرّف التطبيق غير صالح' });
+      return;
+    }
+
+    const developerUser = await verifyDeveloperRequest(req);
+    const existingApp = db.apps.find((a) => a.id === appId);
+    if (!existingApp && !developerUser) {
+      res.status(401).json({ error: 'يرجى تسجيل الدخول لإنشاء رابط قصير جديد' });
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const code = existingApp?.shortCode || generateShortCodeForAppId(appId);
+    const safeIcon =
+      typeof body.iconUrl === 'string' && body.iconUrl.trim().length <= 140_000
+        ? body.iconUrl.trim()
+        : existingApp?.iconUrl || './media/store/brand_nabd.svg';
+    const safePreview =
+      typeof body.previewImageUrl === 'string' && body.previewImageUrl.trim().length <= 140_000
+        ? body.previewImageUrl.trim()
+        : existingApp?.screenshots?.[0];
+
+    if (!Array.isArray(db.shortLinks)) db.shortLinks = [];
+    const existingLink = db.shortLinks.find((s) => s.code === code || s.appId === appId);
+    const nextRecord: ShortLinkRecord = {
+      code,
+      appId,
+      appName:
+        (typeof body.appName === 'string' && body.appName.trim().slice(0, 120)) ||
+        existingApp?.name ||
+        'تطبيق',
+      developer:
+        (typeof body.developer === 'string' && body.developer.trim().slice(0, 120)) ||
+        existingApp?.developer ||
+        developerUser?.name ||
+        'مطور مستقل',
+      shortDescription:
+        (typeof body.shortDescription === 'string' && body.shortDescription.trim().slice(0, 240)) ||
+        existingApp?.shortDescription ||
+        '',
+      versionName:
+        (typeof body.versionName === 'string' && body.versionName.trim().slice(0, 64)) ||
+        existingApp?.versionName ||
+        '1.0.0',
+      iconUrl: safeIcon,
+      ...(safePreview ? { previewImageUrl: safePreview } : {}),
+      ownerUid: existingApp?.ownerUid || developerUser?.uid,
+      createdAt: existingLink?.createdAt || existingApp?.createdAt || now,
+      updatedAt: now,
+    };
+
+    if (existingLink) {
+      Object.assign(existingLink, nextRecord);
+    } else {
+      db.shortLinks.unshift(nextRecord);
+    }
+    if (existingApp) {
+      existingApp.shortCode = code;
+      if (safeIcon.startsWith('data:image/') && (!existingApp.iconUrl || existingApp.iconUrl.startsWith('./uploads/'))) {
+        existingApp.iconUrl = safeIcon;
+      }
+    }
+    await saveStore(db);
+    res.json({ code, shortLink: nextRecord });
+  });
+
+  function resolveShortLinkEntry(code: string): { shortLink: ShortLinkRecord | null; app: StoreApp | null } {
+    const normalized = code.trim();
+    const shortList = db.shortLinks || [];
+    const foundLink = shortList.find((s) => s.code === normalized) || null;
+    let foundApp = foundLink ? db.apps.find((a) => a.id === foundLink.appId) || null : null;
+    if (!foundApp) {
+      foundApp =
+        db.apps.find(
+          (a) => a.shortCode === normalized || generateShortCodeForAppId(a.id) === normalized
+        ) || null;
+    }
+    if (!foundLink && foundApp) {
+      return { shortLink: upsertServerShortLink(db, foundApp), app: foundApp };
+    }
+    return { shortLink: foundLink, app: foundApp };
+  }
+
+  app.get('/api/short-links/:code', (req, res) => {
+    const code = String(req.params.code || '').trim();
+    if (!/^[a-zA-Z0-9_-]{4,32}$/.test(code)) {
+      res.status(400).json({ error: 'الرابط القصير غير صالح' });
+      return;
+    }
+    const { shortLink, app: foundApp } = resolveShortLinkEntry(code);
+    if (!shortLink && !foundApp) {
+      res.status(404).json({ error: 'الرابط القصير غير موجود' });
+      return;
+    }
+    const appReviews = foundApp
+      ? db.reviews
+          .filter((r) => r.appId === foundApp.id)
+          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+      : [];
+    res.json({ shortLink, app: foundApp, reviews: appReviews });
+  });
+
+  async function sendShareImageForRef(
+    res: express.Response,
+    primaryRef?: string,
+    secondaryRef?: string
+  ): Promise<void> {
+    const candidates = [primaryRef, secondaryRef].filter(
+      (v): v is string => typeof v === 'string' && v.trim().length > 0
+    );
+
+    for (const raw of candidates) {
+      const ref = raw.trim().replace(/^\/Play55(?=\/)/i, '');
+      const dataMatch = /^data:(image\/(?:png|jpeg|jpg|webp|svg\+xml));base64,([A-Za-z0-9+/=]+)$/i.exec(ref);
+      if (dataMatch) {
+        const mime = dataMatch[1].toLowerCase() === 'image/jpg' ? 'image/jpeg' : dataMatch[1].toLowerCase();
+        const buf = Buffer.from(dataMatch[2], 'base64');
+        res.setHeader('Content-Type', mime);
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        res.send(buf);
+        return;
+      }
+
+      const cleanRel = ref.replace(/^\.\//, '/');
+      if (cleanRel.startsWith('/uploads/')) {
+        const relSub = cleanRel.slice('/uploads/'.length);
+        const target = path.resolve(UPLOADS_DIR, relSub);
+        const pubTarget = path.resolve(PUBLIC_UPLOADS_DIR, relSub);
+        const fileToSend = fs.existsSync(target) ? target : fs.existsSync(pubTarget) ? pubTarget : null;
+        if (fileToSend && (fileToSend.startsWith(UPLOADS_DIR + path.sep) || fileToSend.startsWith(PUBLIC_UPLOADS_DIR + path.sep))) {
+          res.setHeader('Cache-Control', 'public, max-age=86400');
+          res.sendFile(fileToSend);
+          return;
+        }
+      }
+
+      if (cleanRel.startsWith('/media/')) {
+        const relSub = cleanRel.slice('/media/'.length);
+        const mediaBase = path.join(ROOT_DIR, 'public/media');
+        const target = path.resolve(mediaBase, relSub);
+        if (target.startsWith(mediaBase + path.sep) && fs.existsSync(target)) {
+          res.setHeader('Cache-Control', 'public, max-age=86400');
+          res.sendFile(target);
+          return;
+        }
+      }
+
+      const brandMatch = /^\/api\/brand-icon\/([a-z0-9_-]+)$/i.exec(cleanRel);
+      if (brandMatch?.[1]) {
+        res.setHeader('Content-Type', 'image/svg+xml; charset=utf-8');
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        res.send(renderBrandIconSvg(brandMatch[1]));
+        return;
+      }
+    }
+
+    const fallbackImg = path.join(ROOT_DIR, 'public/media/store/app_icon_atlas_1795812501468.jpg');
+    if (fs.existsSync(fallbackImg)) {
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.sendFile(fallbackImg);
+      return;
+    }
+    res.status(404).end();
+  }
+
+  app.get('/api/apps/:id/share-image', async (req, res) => {
+    const found = db.apps.find((a) => a.id === req.params.id);
+    if (!found) {
+      await sendShareImageForRef(res);
+      return;
+    }
+    await sendShareImageForRef(res, found.iconUrl, found.screenshots?.[0]);
+  });
+
+  app.get('/s/:code/image', async (req, res) => {
+    const code = String(req.params.code || '').trim();
+    const { shortLink, app: foundApp } = resolveShortLinkEntry(code);
+    await sendShareImageForRef(
+      res,
+      shortLink?.iconUrl || foundApp?.iconUrl,
+      shortLink?.previewImageUrl || foundApp?.screenshots?.[0]
+    );
+  });
+
   // Return proper 404 for missing static media or API paths rather than falling through to index.html
   app.use(['/uploads', '/media', '/api'], (_req, res) => {
     res.status(404).json({ error: 'Not found' });
   });
 
-  // Mount Vite dev middleware or production dist
+  function escapeHtmlAttr(value: string): string {
+    return value
+      .replace(/&/g, '&amp;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+  }
+
+  function injectShareMetaIntoHtml(
+    html: string,
+    req: express.Request,
+    meta: {
+      title: string;
+      description: string;
+      imagePath: string;
+      pageUrl: string;
+      injectBaseHref?: boolean;
+    }
+  ): string {
+    const proto = String(req.headers['x-forwarded-proto'] || (req.secure ? 'https' : 'http')).split(',')[0].trim();
+    const host = String(req.headers['x-forwarded-host'] || req.headers.host || 'localhost:3000').split(',')[0].trim();
+    const origin = `${proto}://${host}`;
+    const absImg = meta.imagePath.startsWith('http') ? meta.imagePath : `${origin}${meta.imagePath}`;
+    const absUrl = meta.pageUrl.startsWith('http') ? meta.pageUrl : `${origin}${meta.pageUrl}`;
+    const safeTitle = escapeHtmlAttr(meta.title);
+    const safeDesc = escapeHtmlAttr(meta.description);
+    const safeImg = escapeHtmlAttr(absImg);
+    const safeUrl = escapeHtmlAttr(absUrl);
+
+    let out = html
+      .replace(/<title>[\s\S]*?<\/title>/i, `<title>${safeTitle}</title>`)
+      .replace(/<meta\s+name="description"\s+content="[^"]*"\s*\/?>/i, `<meta name="description" content="${safeDesc}" />`)
+      .replace(/<meta\s+property="og:title"\s+content="[^"]*"\s*\/?>/i, `<meta property="og:title" content="${safeTitle}" />`)
+      .replace(/<meta\s+property="og:description"\s+content="[^"]*"\s*\/?>/i, `<meta property="og:description" content="${safeDesc}" />`)
+      .replace(/<meta\s+property="og:image"\s+content="[^"]*"\s*\/?>/i, `<meta property="og:image" content="${safeImg}" />`)
+      .replace(
+        '</head>',
+        `  <meta property="og:url" content="${safeUrl}" />\n    <meta name="twitter:title" content="${safeTitle}" />\n    <meta name="twitter:description" content="${safeDesc}" />\n    <meta name="twitter:image" content="${safeImg}" />\n    <link rel="icon" href="${safeImg}" />\n${meta.injectBaseHref ? '    <base href="/" />\n' : ''}  </head>`
+      );
+    return out;
+  }
+
+  function resolveMetaForRequest(req: express.Request): {
+    title: string;
+    description: string;
+    imagePath: string;
+    pageUrl: string;
+    injectBaseHref?: boolean;
+  } | null {
+    const codeParam =
+      typeof req.params?.code === 'string'
+        ? req.params.code
+        : typeof req.query.s === 'string'
+        ? req.query.s
+        : '';
+    const appParam = typeof req.query.app === 'string' ? req.query.app : '';
+
+    if (codeParam && /^[a-zA-Z0-9_-]{4,32}$/.test(codeParam)) {
+      const { shortLink, app: foundApp } = resolveShortLinkEntry(codeParam);
+      if (shortLink || foundApp) {
+        const appName = shortLink?.appName || foundApp?.name || 'تطبيق Play55';
+        const ver = shortLink?.versionName || foundApp?.versionName || '1.0.0';
+        const dev = shortLink?.developer || foundApp?.developer || 'Play55';
+        const desc =
+          shortLink?.shortDescription ||
+          foundApp?.shortDescription ||
+          `تثبيت تطبيق ${appName} مباشرة بصيغة APK عبر متجر Play55.`;
+        return {
+          title: `${appName} (v${ver}) — Play55`,
+          description: `${desc} · المطور: ${dev}`,
+          imagePath: `/s/${encodeURIComponent(codeParam)}/image`,
+          pageUrl: req.originalUrl || `/s/${encodeURIComponent(codeParam)}`,
+          injectBaseHref: Boolean(req.params?.code),
+        };
+      }
+      if (req.params?.code) {
+        return {
+          title: 'Play55 | متجر تطبيقات بلس',
+          description: 'تثبيت تطبيق أندرويد مباشرة عبر الرابط القصير في Play55.',
+          imagePath: '/media/store/app_icon_atlas_1795812501468.jpg',
+          pageUrl: req.originalUrl || `/s/${encodeURIComponent(codeParam)}`,
+          injectBaseHref: true,
+        };
+      }
+    }
+
+    if (appParam && /^[a-zA-Z0-9_-]{1,128}$/.test(appParam)) {
+      const foundApp = db.apps.find((a) => a.id === appParam);
+      if (foundApp) {
+        return {
+          title: `${foundApp.name} (v${foundApp.versionName}) — Play55`,
+          description: `${foundApp.shortDescription} · المطور: ${foundApp.developer}`,
+          imagePath: `/api/apps/${encodeURIComponent(foundApp.id)}/share-image`,
+          pageUrl: req.originalUrl || `/?app=${encodeURIComponent(foundApp.id)}`,
+        };
+      }
+    }
+
+    return null;
+  }
+
+  // Mount Vite dev middleware or production dist with dynamic OG meta injection for /s/:code & ?s=/?app=
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
     });
+
+    app.get(['/s/:code', '/'], async (req, res, next) => {
+      const meta = resolveMetaForRequest(req);
+      if (!meta) {
+        next();
+        return;
+      }
+      try {
+        const rawHtml = await fs.promises.readFile(path.join(ROOT_DIR, 'index.html'), 'utf8');
+        const transformed = await vite.transformIndexHtml(req.originalUrl, rawHtml);
+        const injected = injectShareMetaIntoHtml(transformed, req, meta);
+        res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8').send(injected);
+      } catch (err) {
+        next(err);
+      }
+    });
+
     app.use(vite.middlewares);
   } else {
     const distDir = path.join(ROOT_DIR, 'dist');
     app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
+    app.get(['/s/:code', '*'], async (req, res) => {
+      const distIndex = path.join(distDir, 'index.html');
+      const meta = resolveMetaForRequest(req);
+      if (!meta) {
+        res.sendFile(distIndex);
+        return;
+      }
+      try {
+        const rawHtml = await fs.promises.readFile(distIndex, 'utf8');
+        const injected = injectShareMetaIntoHtml(rawHtml, req, meta);
+        res.status(200).setHeader('Content-Type', 'text/html; charset=utf-8').send(injected);
+      } catch {
+        res.sendFile(distIndex);
+      }
     });
   }
 

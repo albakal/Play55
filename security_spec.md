@@ -5,6 +5,7 @@
 - `/apps/{appId}` stores ONLY public catalog metadata (never PII like `ownerEmail`); anyone may `get` or `list` published apps so permanent `?app=APP_ID` links work for unauthenticated visitors across devices.
 - Creating, updating, or deleting `/apps/{appId}` requires an authenticated, email-verified user whose `request.auth.uid == ownerUid`. `id`, `ownerUid`, and `createdAt` are immutable after creation; `createdAt` and `updatedAt` must equal `request.time`.
 - `/apps/{appId}/reviews/{reviewId}` requires an existing parent `/apps/{appId}` (`exists(...)`), authenticated `authorUid == request.auth.uid`, valid rating (`1..5`), and `createdAt == request.time`.
+- `/shortLinks/{code}` stores short link mappings (`code` 4..32 chars) pointing to an existing `/apps/{appId}` (`exists(...)`) plus compressed public app icon/preview metadata. Anyone may `get` a specific short code; `list` is restricted strictly to `resource.data.ownerUid == request.auth.uid`; writes require email-verified ownership and server timestamps (`request.time`).
 
 ## 2. Adversarial Payloads ("Dirty Dozen")
 1. Unauthenticated `get` on `/developers/uid1` -> `PERMISSION_DENIED`
@@ -19,3 +20,4 @@
 10. Oversized `screenshots` array (> 4) or oversized string (`name` > 120) -> `PERMISSION_DENIED`
 11. Orphaned review on nonexistent `/apps/missing-id/reviews/rev-1` -> `PERMISSION_DENIED`
 12. Invalid path variable ID (`../bad-id`) -> `PERMISSION_DENIED`
+13. Orphaned short link creation on nonexistent `/apps/missing-id` or unauthenticated `list` on `/shortLinks` -> `PERMISSION_DENIED`

@@ -25,8 +25,12 @@ import {
   updateDoc,
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
-import type { AppCategory, AppDetailResponse, ReviewItem, StoreApp } from './types.ts';
-import { isValidAppId } from './utils/shareLink.ts';
+import type { AppCategory, AppDetailResponse, ReviewItem, ShortLinkRecord, StoreApp } from './types.ts';
+import {
+  generateShortCodeForAppId,
+  isValidAppId,
+  isValidShortCode,
+} from './utils/shareLink.ts';
 
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
@@ -634,6 +638,7 @@ export async function cloudPublishOrUpdateApp(
         updatePayload.externalApkUrl = deleteField();
       }
       await updateDoc(ref, updatePayload);
+      await cloudUpsertShortLink(syncedAppResult).catch(() => null);
       return { ok: true, syncedApp: syncedAppResult };
     }
 
@@ -656,10 +661,144 @@ export async function cloudPublishOrUpdateApp(
     };
 
     await setDoc(ref, createPayload);
+    await cloudUpsertShortLink(syncedAppResult).catch(() => null);
     return { ok: true, syncedApp: syncedAppResult };
   } catch (error) {
     handleFirestoreError(error, isUpdate ? OperationType.UPDATE : OperationType.CREATE, docPath);
   }
+}
+
+export async function cloudUpsertShortLink(appData: StoreApp): Promise<string | null> {
+  const fbUser = auth.currentUser;
+  if (!fbUser || !fbUser.emailVerified || !isValidAppId(appData.id)) {
+    return null;
+  }
+  const code =
+    appData.shortCode && isValidShortCode(appData.shortCode)
+      ? appData.shortCode
+      : generateShortCodeForAppId(appData.id);
+  const docPath = `shortLinks/${code}`;
+  const ref = doc(db, 'shortLinks', code);
+
+  const safeIcon =
+    (await compressImageDataUrlForCloud(appData.iconUrl, 90_000, 256)) ||
+    './media/store/brand_nabd.svg';
+  const rawPreview = appData.screenshots?.[0] || '';
+  const safePreview = rawPreview
+    ? await compressImageDataUrlForCloud(rawPreview, 90_000, 540)
+    : '';
+
+  const appName = appData.name.trim().slice(0, 120) || 'تطبيق';
+  const developer = (appData.developer.trim() || fbUser.displayName || 'مطور مستقل').slice(0, 120);
+  const shortDescription = (appData.shortDescription.trim() || appName).slice(0, 240);
+  const versionName = (appData.versionName.trim() || '1.0.0').slice(0, 64);
+
+  try {
+    const existingSnap = await getDoc(ref);
+    if (existingSnap.exists()) {
+      const existingData = existingSnap.data();
+      if (existingData?.ownerUid !== fbUser.uid || existingData?.appId !== appData.id) {
+        return code;
+      }
+      const updatePayload: Record<string, unknown> = {
+        appName,
+        developer,
+        shortDescription,
+        versionName,
+        iconUrl: safeIcon.slice(0, 120_000),
+        updatedAt: serverTimestamp(),
+      };
+      if (safePreview) {
+        updatePayload.previewImageUrl = safePreview.slice(0, 120_000);
+      } else if (existingData?.previewImageUrl) {
+        updatePayload.previewImageUrl = deleteField();
+      }
+      await updateDoc(ref, updatePayload);
+      return code;
+    }
+
+    await setDoc(ref, {
+      code,
+      appId: appData.id,
+      ownerUid: fbUser.uid,
+      appName,
+      developer,
+      shortDescription,
+      versionName,
+      iconUrl: safeIcon.slice(0, 120_000),
+      ...(safePreview ? { previewImageUrl: safePreview.slice(0, 120_000) } : {}),
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+    return code;
+  } catch (error) {
+    handleFirestoreError(error, OperationType.WRITE, docPath);
+  }
+}
+
+export async function cloudResolveShortLink(
+  code: string
+): Promise<{ record: ShortLinkRecord; previewApp: StoreApp } | null> {
+  if (!isValidShortCode(code)) return null;
+  const docPath = `shortLinks/${code}`;
+  let snap;
+  try {
+    snap = await getDoc(doc(db, 'shortLinks', code));
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, docPath);
+  }
+  if (!snap.exists()) return null;
+
+  const raw = snap.data() as Record<string, unknown>;
+  const appId = typeof raw.appId === 'string' ? raw.appId : '';
+  if (!isValidAppId(appId)) return null;
+
+  const record: ShortLinkRecord = {
+    code,
+    appId,
+    appName: String(raw.appName || 'تطبيق'),
+    developer: String(raw.developer || 'مطور مستقل'),
+    shortDescription: String(raw.shortDescription || ''),
+    versionName: String(raw.versionName || '1.0.0'),
+    iconUrl: typeof raw.iconUrl === 'string' ? raw.iconUrl : './media/store/brand_nabd.svg',
+    previewImageUrl: typeof raw.previewImageUrl === 'string' ? raw.previewImageUrl : undefined,
+    ownerUid: typeof raw.ownerUid === 'string' ? raw.ownerUid : undefined,
+    createdAt: toIsoTimestamp(raw.createdAt),
+    updatedAt: toIsoTimestamp(raw.updatedAt),
+  };
+
+  const previewApp: StoreApp = {
+    id: record.appId,
+    shortCode: record.code,
+    name: record.appName,
+    developer: record.developer,
+    category: 'الأدوات',
+    shortDescription: record.shortDescription,
+    fullDescription: record.shortDescription,
+    whatsNew: '',
+    packageName: 'com.play55.app',
+    versionName: record.versionName,
+    versionCode: '1',
+    minAndroid: 'Android 8.0+',
+    ageRating: '+3',
+    sizeMB: 1,
+    iconUrl: record.iconUrl,
+    screenshots: record.previewImageUrl ? [record.previewImageUrl] : [],
+    apkFilename: '',
+    hasCustomApk: false,
+    permissionsCount: 0,
+    downloads: 1,
+    averageRating: 0,
+    reviewCount: 0,
+    ratingDistribution: { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 },
+    featured: false,
+    syncedToCloud: true,
+    ownerUid: record.ownerUid,
+    createdAt: record.createdAt,
+    updatedAt: record.updatedAt,
+  };
+
+  return { record, previewApp };
 }
 
 export async function cloudDeleteApp(appId: string): Promise<boolean> {

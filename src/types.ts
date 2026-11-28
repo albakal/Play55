@@ -54,8 +54,24 @@ export interface StoreApp {
   };
   featured?: boolean;
   syncedToCloud?: boolean;
+  serverSynced?: boolean;
+  shortCode?: string;
   ownerUid?: string;
   ownerEmail?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ShortLinkRecord {
+  code: string;
+  appId: string;
+  appName: string;
+  developer: string;
+  shortDescription: string;
+  versionName: string;
+  iconUrl: string;
+  previewImageUrl?: string;
+  ownerUid?: string;
   createdAt: string;
   updatedAt: string;
 }

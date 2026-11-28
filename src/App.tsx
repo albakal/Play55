@@ -6,6 +6,7 @@ import {
   Download,
   RefreshCw,
   Search,
+  Smartphone,
   Star,
   Upload,
 } from 'lucide-react';
@@ -21,6 +22,7 @@ import {
   cloudGetAppDetail,
   cloudListApps,
   cloudPublishOrUpdateApp,
+  cloudResolveShortLink,
   isPortableMediaRef,
   needsCloudMediaRepair,
   signInWithGoogle,
@@ -32,31 +34,34 @@ import {
   FALLBACK_APPS,
 } from './catalog/fallbackStore.ts';
 import {
-  localBuildOrFetchApkBlob,
   localClearSession,
   localGetAppDetail,
   localGetSession,
-  localHasStoredApkBlob,
-  localIncrementInstall,
   localListApps,
   localLoginDeveloper,
   localMarkAppSynced,
   localRegisterDeveloper,
   localSaveSession,
-  localVerifyApkBlob,
 } from './utils/localStoreEngine.ts';
 import {
   getAppDownloadInfo,
   getDownloadedAppsMap,
   INSTALL_HISTORY_EVENT,
-  recordAppDownload,
 } from './utils/installHistory.ts';
 import type { DownloadedAppRecord } from './utils/installHistory.ts';
 import {
-  decodeSharedAppSnapshot,
+  decodeSharedAppSnapshotAsync,
   extractAppIdFromLocation,
+  extractShortCodeFromLocation,
   FALLBACK_APP_IDS,
+  generateShortCodeForAppId,
+  getAppBasePathname,
 } from './utils/shareLink.ts';
+import {
+  openApkInAndroidInstaller,
+  runDirectApkInstall,
+} from './utils/apkInstaller.ts';
+import type { CompletedInstallArtifact } from './utils/apkInstaller.ts';
 import { StoreHeader } from './components/StoreHeader.tsx';
 import type { NavTab } from './components/StoreHeader.tsx';
 import { AppIcon } from './components/AppIcon.tsx';
@@ -84,6 +89,7 @@ export default function App() {
   const [apps, setApps] = useState<StoreApp[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [serverOnline, setServerOnline] = useState(false);
 
   const [activeTab, setActiveTab] = useState<NavTab>('apps');
   const [selectedCategory, setSelectedCategory] = useState<'الكل' | AppCategory>('الكل');
@@ -92,13 +98,22 @@ export default function App() {
   const [selectedAppId, setSelectedAppId] = useState<string | null>(() =>
     extractAppIdFromLocation()
   );
+  const [pendingShortCode, setPendingShortCode] = useState<string | null>(() =>
+    extractAppIdFromLocation() ? null : extractShortCodeFromLocation()
+  );
   const [detailData, setDetailData] = useState<AppDetailResponse | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
 
   const [quickInstallingId, setQuickInstallingId] = useState<string | null>(null);
+  const [quickInstallPercent, setQuickInstallPercent] = useState<number>(0);
   const [quickInstalledId, setQuickInstalledId] = useState<string | null>(null);
   const [quickInstallError, setQuickInstallError] = useState<string | null>(null);
+  const [quickReadyArtifact, setQuickReadyArtifact] = useState<{
+    appId: string;
+    appName: string;
+    artifact: CompletedInstallArtifact;
+  } | null>(null);
   const [downloadHistory, setDownloadHistory] = useState<Record<string, DownloadedAppRecord>>(() =>
     getDownloadedAppsMap()
   );
@@ -119,6 +134,14 @@ export default function App() {
       window.removeEventListener('storage', refreshHistory);
     };
   }, []);
+
+  useEffect(() => {
+    return () => {
+      if (quickReadyArtifact?.artifact.blobUrl) {
+        URL.revokeObjectURL(quickReadyArtifact.artifact.blobUrl);
+      }
+    };
+  }, [quickReadyArtifact]);
 
   useEffect(() => {
     let active = true;
@@ -388,15 +411,18 @@ export default function App() {
       if (!res.ok || !contentType.includes('application/json')) {
         throw new Error('Static fallback');
       }
+      setServerOnline(true);
       const data = (await res.json()) as { apps: StoreApp[] };
       const cloudApps = await cloudPromise;
       const cloudIds = new Set(cloudApps.map((c) => c.id));
       const backendApps = data.apps.map((a) => ({
         ...a,
+        serverSynced: true,
         syncedToCloud: FALLBACK_APP_IDS.has(a.id) || cloudIds.has(a.id) || Boolean(a.syncedToCloud),
       }));
       setApps(sortCatalogApps(mergeAppLists(backendApps, cloudApps), sort));
     } catch {
+      setServerOnline(false);
       try {
         const [localApps, cloudApps] = await Promise.all([
           localListApps(sort),
@@ -463,33 +489,55 @@ export default function App() {
     };
   }, [apps, currentUser]);
 
-  const syncAppQueryUrl = useCallback((appId: string | null) => {
-    try {
-      const url = new URL(window.location.href);
-      if (appId) {
-        url.searchParams.set('app', appId);
-        url.hash = '';
-      } else {
-        url.searchParams.delete('app');
-        if (url.hash.startsWith('#p55=') || url.hash.includes('app=')) {
+  const syncAppQueryUrl = useCallback(
+    (appId: string | null, shortCodeOverride?: string) => {
+      try {
+        const url = new URL(window.location.href);
+        const basePath = getAppBasePathname(url.pathname);
+        if (appId) {
+          const code = shortCodeOverride || generateShortCodeForAppId(appId);
+          url.searchParams.delete('app');
+          url.searchParams.delete('s');
+          if (serverOnline) {
+            const cleanBase = basePath === '/' ? '' : basePath.replace(/\/$/, '');
+            url.pathname = `${cleanBase}/s/${code}`;
+          } else {
+            url.pathname = basePath;
+            url.searchParams.set('s', code);
+          }
           url.hash = '';
+        } else {
+          url.pathname = basePath;
+          url.searchParams.delete('app');
+          url.searchParams.delete('s');
+          if (
+            url.hash.startsWith('#p55=') ||
+            url.hash.startsWith('#p55z=') ||
+            url.hash.includes('app=')
+          ) {
+            url.hash = '';
+          }
         }
+        window.history.pushState({ appId }, '', url.toString());
+      } catch {
+        // Ignore history API issues
       }
-      window.history.pushState({ appId }, '', url.toString());
-    } catch {
-      // Ignore history API issues
-    }
-  }, []);
+    },
+    [serverOnline]
+  );
 
   const openAppDetail = useCallback(
     async (appId: string, pushHistory = true) => {
+      setPendingShortCode(null);
       setSelectedAppId(appId);
       setDetailError(null);
       setLoadingDetail(true);
       if (pushHistory) {
         const currentParam = extractAppIdFromLocation();
-        if (currentParam !== appId) {
-          syncAppQueryUrl(appId);
+        const currentShort = extractShortCodeFromLocation();
+        const targetCode = generateShortCodeForAppId(appId);
+        if (currentParam !== appId && currentShort !== targetCode) {
+          syncAppQueryUrl(appId, targetCode);
         }
       }
       window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -500,6 +548,7 @@ export default function App() {
           const res = await fetch(`./api/apps/${encodeURIComponent(appId)}`);
           const contentType = res.headers.get('content-type') || '';
           if (res.ok && contentType.includes('application/json')) {
+            setServerOnline(true);
             backendDetail = (await res.json()) as AppDetailResponse;
           }
         } catch {
@@ -510,7 +559,7 @@ export default function App() {
 
         if (backendDetail && cloudDetail) {
           const [mergedApp] = mergeAppLists(
-            [{ ...backendDetail.app, syncedToCloud: true }],
+            [{ ...backendDetail.app, serverSynced: true, syncedToCloud: true }],
             [cloudDetail.app]
           );
           const mergedReviews =
@@ -530,6 +579,7 @@ export default function App() {
           setDetailData({
             app: {
               ...backendDetail.app,
+              serverSynced: true,
               syncedToCloud:
                 FALLBACK_APP_IDS.has(backendDetail.app.id) ||
                 Boolean(backendDetail.app.syncedToCloud),
@@ -545,7 +595,7 @@ export default function App() {
           return;
         }
 
-        const snapshotApp = decodeSharedAppSnapshot(appId);
+        const snapshotApp = await decodeSharedAppSnapshotAsync(appId);
         if (snapshotApp) {
           setDetailData({ app: snapshotApp, reviews: [] });
           return;
@@ -557,22 +607,117 @@ export default function App() {
         setLoadingDetail(false);
       }
     },
-    [syncAppQueryUrl]
+    [mergeAppLists, syncAppQueryUrl]
+  );
+
+  const openShortCodeDetail = useCallback(
+    async (shortCode: string) => {
+      setDetailError(null);
+      setLoadingDetail(true);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+
+      try {
+        // 1. Try Express backend short-link resolver (/api/short-links/:code)
+        try {
+          const res = await fetch(`./api/short-links/${encodeURIComponent(shortCode)}`);
+          const ct = res.headers.get('content-type') || '';
+          if (res.ok && ct.includes('application/json')) {
+            setServerOnline(true);
+            const data = (await res.json()) as {
+              app?: StoreApp | null;
+              reviews?: ReviewItem[];
+              shortLink?: { appId: string };
+            };
+            if (data.app) {
+              setSelectedAppId(data.app.id);
+              setPendingShortCode(null);
+              setDetailData({
+                app: { ...data.app, serverSynced: true },
+                reviews: data.reviews || [],
+              });
+              return;
+            }
+            if (data.shortLink?.appId) {
+              await openAppDetail(data.shortLink.appId, false);
+              return;
+            }
+          }
+        } catch {
+          // Server unreachable; continue with cloud/local/snapshot
+        }
+
+        // 2. Try Firestore /shortLinks/{code} -> full /apps/{appId} (with image preview fallback)
+        const cloudResolved = await cloudResolveShortLink(shortCode).catch(() => null);
+        if (cloudResolved) {
+          setSelectedAppId(cloudResolved.record.appId);
+          setPendingShortCode(null);
+          const fullDetail = await cloudGetAppDetail(cloudResolved.record.appId).catch(() => null);
+          if (fullDetail) {
+            setDetailData(fullDetail);
+            return;
+          }
+          setDetailData({ app: cloudResolved.previewApp, reviews: [] });
+          return;
+        }
+
+        // 3. Try matching locally stored apps & built-in catalog apps by deterministic shortCode
+        const localCatalog = await localListApps('popular').catch(() => FALLBACK_APPS);
+        const combined = mergeAppLists(localCatalog, FALLBACK_APPS);
+        const matched = combined.find(
+          (item) => (item.shortCode || generateShortCodeForAppId(item.id)) === shortCode
+        );
+        if (matched) {
+          await openAppDetail(matched.id, false);
+          return;
+        }
+
+        // 4. Finally decode compressed/compact embedded snapshot in URL hash (#p55z= / #p55=)
+        const snapshotApp = await decodeSharedAppSnapshotAsync();
+        if (snapshotApp) {
+          setSelectedAppId(snapshotApp.id);
+          setPendingShortCode(null);
+          setDetailData({ app: snapshotApp, reviews: [] });
+          return;
+        }
+
+        setDetailData(null);
+        setDetailError('الرابط القصير غير صالح أو أن التطبيق المطلوب قد تم حذفه.');
+      } finally {
+        setLoadingDetail(false);
+      }
+    },
+    [mergeAppLists, openAppDetail]
   );
 
   useEffect(() => {
     if (selectedAppId && !detailData && !detailError) {
       void openAppDetail(selectedAppId, false);
+    } else if (!selectedAppId && pendingShortCode && !detailData && !detailError) {
+      void openShortCodeDetail(pendingShortCode);
     }
-  }, [selectedAppId, detailData, detailError, openAppDetail]);
+  }, [
+    selectedAppId,
+    pendingShortCode,
+    detailData,
+    detailError,
+    openAppDetail,
+    openShortCodeDetail,
+  ]);
 
   useEffect(() => {
     const onPopState = () => {
       const appParam = extractAppIdFromLocation();
+      const shortParam = extractShortCodeFromLocation();
       if (appParam) {
         setActiveTab('apps');
         void openAppDetail(appParam, false);
+      } else if (shortParam) {
+        setActiveTab('apps');
+        setSelectedAppId(null);
+        setPendingShortCode(shortParam);
+        void openShortCodeDetail(shortParam);
       } else {
+        setPendingShortCode(null);
         setSelectedAppId(null);
         setDetailData(null);
         setDetailError(null);
@@ -580,17 +725,18 @@ export default function App() {
     };
     window.addEventListener('popstate', onPopState);
     return () => window.removeEventListener('popstate', onPopState);
-  }, [openAppDetail]);
+  }, [openAppDetail, openShortCodeDetail]);
 
   const handleSelectTab = (tab: NavTab) => {
     setActiveTab(tab);
     if (tab !== 'upload') {
       setEditingApp(null);
     }
+    setPendingShortCode(null);
     setSelectedAppId(null);
     setDetailData(null);
     setDetailError(null);
-    if (extractAppIdFromLocation()) {
+    if (extractAppIdFromLocation() || extractShortCodeFromLocation()) {
       syncAppQueryUrl(null);
     }
     window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -615,115 +761,51 @@ export default function App() {
   }, [apps]);
 
   const handleQuickInstall = async (app: StoreApp) => {
+    if (quickInstallingId) return;
     setQuickInstallingId(app.id);
+    setQuickInstallPercent(8);
     setQuickInstallError(null);
+    setQuickReadyArtifact(null);
 
-    let backendOnline = false;
-    let verified = false;
-    let resolvedSha256: string | null = app.apkSha256 || null;
-
-    try {
-      const vRes = await fetch(`./api/apps/${encodeURIComponent(app.id)}/verify-apk`);
-      const vCt = vRes.headers.get('content-type') || '';
-      if (vCt.includes('application/json')) {
-        backendOnline = true;
-        const vData = (await vRes.json()) as { valid?: boolean; sha256?: string | null };
-        if (!vRes.ok || !vData.valid) {
+    const artifact = await runDirectApkInstall(
+      app,
+      (progress) => {
+        if (progress.stage === 'error') {
           setQuickInstallingId(null);
-          setQuickInstallError(`تعذر تثبيت «${app.name}»: ملف APK تالف أو غير مكتمل.`);
+          setQuickInstallPercent(0);
+          setQuickInstallError(progress.error || `تعذر تثبيت «${app.name}».`);
           return;
         }
-        resolvedSha256 = vData.sha256 || resolvedSha256;
-        verified = true;
-      }
-    } catch {
-      backendOnline = false;
-    }
-
-    let resolvedExternalUrl: string | null = null;
-    if (!backendOnline) {
-      const hasLocalBlob = await localHasStoredApkBlob(app.id);
-      const safeExternal =
-        app.externalApkUrl && /^https:\/\/[^\s@]+$/.test(app.externalApkUrl)
-          ? app.externalApkUrl
-          : null;
-      if (app.hasCustomApk && !safeExternal && !hasLocalBlob) {
-        setQuickInstallingId(null);
-        setQuickInstallError(
-          `«${app.name}» منشور على استضافة ثابتة بدون رابط HTTPS مباشر لملف APK؛ يرجى من المطور إضافة رابط التوزيع في صفحة التحديث أو النشر من خادم Play55 الكامل.`
+        setQuickInstallPercent(progress.percent);
+      },
+      (nextDownloads) => {
+        setApps((prev) =>
+          prev.map((a) => (a.id === app.id ? { ...a, downloads: nextDownloads } : a))
         );
-        return;
       }
-      const localCheck = await localVerifyApkBlob(app);
-      if (!localCheck.valid) {
-        setQuickInstallingId(null);
-        setQuickInstallError(`تعذر تثبيت «${app.name}»: ملف APK تالف أو غير مكتمل.`);
-        return;
-      }
-      resolvedSha256 = localCheck.sha256 || resolvedSha256;
-      resolvedExternalUrl = localCheck.externalApkUrl || safeExternal || null;
-      verified = true;
-    }
+    );
 
-    if (!verified) {
+    if (!artifact) {
       setQuickInstallingId(null);
-      setQuickInstallError('تعذر التحقق من سلامة ملف APK قبل التثبيت.');
       return;
     }
 
-    if (resolvedExternalUrl) {
-      const link = document.createElement('a');
-      link.href = resolvedExternalUrl;
-      link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
-      link.rel = 'noopener noreferrer';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-    } else if (backendOnline) {
-      try {
-        const res = await fetch(`./api/apps/${encodeURIComponent(app.id)}/install`, {
-          method: 'POST',
-        });
-        const contentType = res.headers.get('content-type') || '';
-        if (res.ok && contentType.includes('application/json')) {
-          const data = (await res.json()) as { downloads: number };
-          setApps((prev) =>
-            prev.map((a) => (a.id === app.id ? { ...a, downloads: data.downloads } : a))
-          );
-        }
-      } catch {
-        // Ignore non-critical counter failure
-      }
-
-      const link = document.createElement('a');
-      link.href = `./api/apps/${encodeURIComponent(app.id)}/install-apk`;
-      link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-    } else {
-      const nextDownloads = await localIncrementInstall(app).catch(() => app.downloads + 1);
-      setApps((prev) =>
-        prev.map((a) => (a.id === app.id ? { ...a, downloads: nextDownloads } : a))
-      );
-      const apkBlob = await localBuildOrFetchApkBlob(app);
-      const blobUrl = URL.createObjectURL(apkBlob);
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
-    }
-
-    recordAppDownload(app, resolvedSha256);
-
+    setQuickInstallingId(null);
+    setQuickInstallPercent(100);
+    setQuickInstalledId(app.id);
+    setQuickReadyArtifact({
+      appId: app.id,
+      appName: app.name,
+      artifact,
+    });
     window.setTimeout(() => {
-      setQuickInstallingId(null);
-      setQuickInstalledId(app.id);
-      window.setTimeout(() => setQuickInstalledId(null), 2500);
-    }, 450);
+      setQuickInstalledId((prev) => (prev === app.id ? null : prev));
+    }, 3500);
+  };
+
+  const handleLaunchQuickArtifact = async () => {
+    if (!quickReadyArtifact) return;
+    await openApkInAndroidInstaller(quickReadyArtifact.artifact);
   };
 
   const handleAppUpdated = (updatedApp: StoreApp, updatedReviews?: ReviewItem[]) => {
@@ -740,6 +822,7 @@ export default function App() {
 
   const handleAppDeleted = (appId: string) => {
     setApps((prev) => prev.filter((a) => a.id !== appId));
+    setPendingShortCode(null);
     setSelectedAppId(null);
     setDetailData(null);
     setDetailError(null);
@@ -748,10 +831,11 @@ export default function App() {
 
   const handleStartEdit = (app: StoreApp) => {
     setEditingApp(app);
+    setPendingShortCode(null);
     setSelectedAppId(null);
     setDetailData(null);
     setDetailError(null);
-    if (new URLSearchParams(window.location.search).has('app')) {
+    if (extractAppIdFromLocation() || extractShortCodeFromLocation()) {
       syncAppQueryUrl(null);
     }
     setActiveTab('upload');
@@ -781,7 +865,8 @@ export default function App() {
     selectedCategory === 'الكل' &&
     searchQuery.trim() === '' &&
     featuredApp !== null &&
-    !selectedAppId;
+    !selectedAppId &&
+    !pendingShortCode;
 
   return (
     <div className="min-h-screen flex flex-col bg-white text-[#202124]">
@@ -793,6 +878,7 @@ export default function App() {
             user={currentUser}
             apps={apps}
             editingApp={editingApp}
+            serverOnline={serverOnline}
             authLoading={authLoading}
             authError={authError}
             onManualAuth={handleManualAuth}
@@ -805,7 +891,7 @@ export default function App() {
             onCancelEdit={() => setEditingApp(null)}
             onAppSaved={handleAppSaved}
           />
-        ) : selectedAppId ? (
+        ) : selectedAppId || pendingShortCode ? (
           detailError ? (
             <div className="max-w-xl mx-auto px-4 sm:px-6 lg:px-8 py-20 text-center space-y-4">
               <p className="text-base font-bold text-[#202124]">{detailError}</p>
@@ -827,8 +913,10 @@ export default function App() {
               app={detailData.app}
               reviews={detailData.reviews}
               currentUser={currentUser}
+              serverOnline={serverOnline}
               getAuthToken={getAuthToken}
               onBack={() => {
+                setPendingShortCode(null);
                 setSelectedAppId(null);
                 setDetailData(null);
                 setDetailError(null);
@@ -986,14 +1074,14 @@ export default function App() {
                             )}
                             <span>
                               {quickInstallingId === featuredApp.id
-                                ? 'جاري تجهيز APK...'
+                                ? `جاري التنزيل للتثبيت ${quickInstallPercent}%...`
                                 : quickInstalledId === featuredApp.id
-                                ? 'تم بدء التنزيل لنظام Android'
+                                ? 'اكتمل التجهيز — جارٍ التثبيت'
                                 : isHeroUpdate
-                                ? `تحديث (v${featuredApp.versionName})`
+                                ? `تحديث وتثبيت (v${featuredApp.versionName})`
                                 : isHeroInstalled
-                                ? 'إعادة تنزيل'
-                                : 'تنزيل التطبيق'}
+                                ? 'إعادة تثبيت التطبيق'
+                                : 'تثبيت التطبيق'}
                             </span>
                           </button>
                         );
@@ -1020,6 +1108,35 @@ export default function App() {
                   />
                 </div>
               </section>
+            )}
+
+            {/* Immediate Post-Download Package Installer Handoff Banner */}
+            {quickReadyArtifact && (
+              <div className="p-4 bg-[#E6F4EA] border border-[#01875F]/30 text-[#016E4D] rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-center gap-2.5 text-xs font-semibold">
+                  <Smartphone className="w-4 h-4 shrink-0" />
+                  <span>
+                    اكتمل تنزيل «{quickReadyArtifact.appName}» وجاهز للتثبيت المباشر دون الدخول لملفات الهاتف.
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => void handleLaunchQuickArtifact()}
+                    className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] rounded-xl transition-colors"
+                  >
+                    <Smartphone className="w-3.5 h-3.5" />
+                    <span>فتح مُثبّت الحزم الآن</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setQuickReadyArtifact(null)}
+                    className="px-2.5 py-1.5 text-xs font-medium text-[#016E4D] hover:underline"
+                  >
+                    إغلاق
+                  </button>
+                </div>
+              </div>
             )}
 
             {/* Quick Install Validation Error */}
@@ -1186,24 +1303,24 @@ export default function App() {
                             {isInstalledNow ? (
                               <>
                                 <CheckCircle2 className="w-3.5 h-3.5" />
-                                <span>تم التنزيل</span>
+                                <span>جاهز للتثبيت</span>
                               </>
                             ) : isInstalling ? (
-                              <span>جاري التجهيز...</span>
+                              <span>تثبيت {quickInstallPercent}%...</span>
                             ) : hasUpdate ? (
                               <>
                                 <RefreshCw className="w-3.5 h-3.5" />
-                                <span>تحديث</span>
+                                <span>تحديث وتثبيت</span>
                               </>
                             ) : alreadyDownloaded ? (
                               <>
                                 <CheckCircle2 className="w-3.5 h-3.5" />
-                                <span>إعادة تنزيل</span>
+                                <span>إعادة تثبيت</span>
                               </>
                             ) : (
                               <>
                                 <Download className="w-3.5 h-3.5" />
-                                <span>تنزيل</span>
+                                <span>تثبيت</span>
                               </>
                             )}
                           </button>

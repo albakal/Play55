@@ -120,6 +120,33 @@ service cloud.firestore {
         && data.createdAt is timestamp;
     }
 
+    function isValidShortCode(code) {
+      return code is string && code.size() >= 4 && code.size() <= 32 && code.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidShortLink(data) {
+      return data.keys().hasAll([
+          'code', 'appId', 'ownerUid', 'appName', 'developer',
+          'shortDescription', 'versionName', 'iconUrl', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'code', 'appId', 'ownerUid', 'appName', 'developer',
+          'shortDescription', 'versionName', 'iconUrl', 'previewImageUrl',
+          'createdAt', 'updatedAt'
+        ])
+        && isValidShortCode(data.code)
+        && isValidId(data.appId)
+        && isValidId(data.ownerUid)
+        && data.appName is string && data.appName.size() >= 1 && data.appName.size() <= 120
+        && data.developer is string && data.developer.size() >= 1 && data.developer.size() <= 120
+        && data.shortDescription is string && data.shortDescription.size() >= 1 && data.shortDescription.size() <= 240
+        && data.versionName is string && data.versionName.size() >= 1 && data.versionName.size() <= 64
+        && data.iconUrl is string && data.iconUrl.size() <= 120000
+        && (!('previewImageUrl' in data) || (data.previewImageUrl is string && data.previewImageUrl.size() <= 120000))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
     match /developers/{userId} {
       allow get: if isValidId(userId) && isOwner(userId);
       allow list: if false;
@@ -189,6 +216,36 @@ service cloud.firestore {
 
         allow delete: if isValidId(appId) && isValidId(reviewId) && isOwner(existing().authorUid);
       }
+    }
+
+    match /shortLinks/{code} {
+      allow get: if isValidShortCode(code);
+      allow list: if isSignedIn() && resource.data.ownerUid == request.auth.uid;
+
+      allow create: if isValidShortCode(code)
+        && isSignedIn()
+        && isValidShortLink(incoming())
+        && incoming().code == code
+        && incoming().ownerUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/apps/$(incoming().appId));
+
+      allow update: if isValidShortCode(code)
+        && isSignedIn()
+        && isValidShortLink(incoming())
+        && incoming().code == existing().code
+        && incoming().appId == existing().appId
+        && incoming().ownerUid == existing().ownerUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && isOwner(existing().ownerUid)
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'appName', 'developer', 'shortDescription', 'versionName',
+          'iconUrl', 'previewImageUrl', 'updatedAt'
+        ]);
+
+      allow delete: if isValidShortCode(code) && isOwner(existing().ownerUid);
     }
   }
 }

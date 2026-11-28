@@ -249,6 +249,68 @@
         }
       },
       "required": ["id", "appId", "authorUid", "authorName", "rating", "comment", "helpfulCount", "createdAt"]
+    },
+    "ShortLinkItem": {
+      "title": "ShortLinkItem",
+      "description": "Short direct share link mapping to a Play55 app along with embedded app icon and preview metadata.",
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 32,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "appId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "appName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "developer": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "shortDescription": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240
+        },
+        "versionName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "iconUrl": {
+          "type": "string",
+          "maxLength": 120000
+        },
+        "previewImageUrl": {
+          "type": "string",
+          "maxLength": 120000
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["code", "appId", "ownerUid", "appName", "developer", "shortDescription", "versionName", "iconUrl", "createdAt", "updatedAt"]
     }
   },
   "firestore": {
@@ -269,6 +331,12 @@
         "$ref": "#/entities/AppReview"
       },
       "description": "Public reviews for a specific application."
+    },
+    "/shortLinks/{code}": {
+      "schema": {
+        "$ref": "#/entities/ShortLinkItem"
+      },
+      "description": "Short direct links (?s=CODE or /s/CODE) resolving to an app and embedding its visual preview metadata."
     }
   }
 }

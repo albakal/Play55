@@ -23,22 +23,29 @@ import type { DeveloperSessionUser, ReviewItem, StoreApp } from '../types.ts';
 import { resolveAssetUrl } from '../catalog/fallbackStore.ts';
 import { auth, cloudDeleteApp, cloudSubmitReview } from '../firebase.ts';
 import {
-  localBuildOrFetchApkBlob,
   localDeleteApp,
-  localHasStoredApkBlob,
-  localIncrementInstall,
   localSubmitReview,
-  localVerifyApkBlob,
   localVoteHelpful,
 } from '../utils/localStoreEngine.ts';
 import {
   getAppDownloadInfo,
   getDownloadedAppsMap,
   INSTALL_HISTORY_EVENT,
-  recordAppDownload,
 } from '../utils/installHistory.ts';
 import type { DownloadedAppRecord } from '../utils/installHistory.ts';
-import { buildPermanentAppShareUrl } from '../utils/shareLink.ts';
+import {
+  buildCompressedShortShareUrl,
+  buildPermanentAppShareUrl,
+} from '../utils/shareLink.ts';
+import {
+  openApkInAndroidInstaller,
+  runDirectApkInstall,
+} from '../utils/apkInstaller.ts';
+import type {
+  CompletedInstallArtifact,
+  InstallProgressState,
+} from '../utils/apkInstaller.ts';
+import { shareShortLinkWithAppImage } from '../utils/shareWithImage.ts';
 import { AppIcon } from './AppIcon.tsx';
 import { StarRating } from './StarRating.tsx';
 
@@ -46,6 +53,7 @@ interface AppDetailViewProps {
   app: StoreApp;
   reviews: ReviewItem[];
   currentUser: DeveloperSessionUser | null;
+  serverOnline?: boolean;
   getAuthToken: () => Promise<string | null>;
   onBack: () => void;
   onEditApp: (app: StoreApp) => void;
@@ -75,30 +83,28 @@ export function AppDetailView({
   app,
   reviews,
   currentUser,
+  serverOnline = false,
   getAuthToken,
   onBack,
   onEditApp,
   onAppUpdated,
   onAppDeleted,
 }: AppDetailViewProps) {
-  const [installPhase, setInstallPhase] = useState<'idle' | 'verifying' | 'handoff' | 'error'>('idle');
-  const [installProgress, setInstallProgress] = useState(0);
-  const [installError, setInstallError] = useState<string | null>(null);
-  const [apkCheckInfo, setApkCheckInfo] = useState<{
-    isBinaryManifest: boolean;
-    isSignedApk: boolean;
-    signatureScheme?: string | null;
-    signerCertSha256?: string | null;
-    sha256?: string | null;
-    externalApkUrl?: string | null;
-    viaBlob?: boolean;
-  } | null>(null);
+  const [installState, setInstallState] = useState<InstallProgressState>({
+    stage: 'idle',
+    percent: 0,
+    downloadedBytes: 0,
+    totalBytes: 0,
+  });
+  const [completedArtifact, setCompletedArtifact] = useState<CompletedInstallArtifact | null>(null);
+  const [installerLaunchedNotice, setInstallerLaunchedNotice] = useState<string | null>(null);
   const [downloadHistory, setDownloadHistory] = useState<Record<string, DownloadedAppRecord>>(() =>
     getDownloadedAppsMap()
   );
   const [showQrPanel, setShowQrPanel] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
   const [copiedShare, setCopiedShare] = useState(false);
+  const [shareImageStatus, setShareImageStatus] = useState<string | null>(null);
   const [lightboxImage, setLightboxImage] = useState<string | null>(null);
   const [brokenShots, setBrokenShots] = useState<Record<string, boolean>>({});
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -112,7 +118,28 @@ export function AppDetailView({
   const [reviewSuccess, setReviewSuccess] = useState(false);
   const [helpfulVoted, setHelpfulVoted] = useState<Record<string, boolean>>({});
 
-  const permanentAppUrl = buildPermanentAppShareUrl(app);
+  const shareOpts = { preferPathShortLink: serverOnline, serverOnline };
+  const [shortAppUrl, setShortAppUrl] = useState<string>(() =>
+    buildPermanentAppShareUrl(app, shareOpts)
+  );
+
+  useEffect(() => {
+    let active = true;
+    const syncInitial = buildPermanentAppShareUrl(app, {
+      preferPathShortLink: serverOnline,
+      serverOnline,
+    });
+    setShortAppUrl(syncInitial);
+    void buildCompressedShortShareUrl(app, {
+      preferPathShortLink: serverOnline,
+      serverOnline,
+    }).then((compressedUrl) => {
+      if (active) setShortAppUrl(compressedUrl);
+    });
+    return () => {
+      active = false;
+    };
+  }, [app, serverOnline]);
 
   useEffect(() => {
     const refreshHistory = () => setDownloadHistory(getDownloadedAppsMap());
@@ -125,10 +152,17 @@ export function AppDetailView({
   }, []);
 
   useEffect(() => {
-    setInstallPhase('idle');
-    setInstallProgress(0);
-    setInstallError(null);
-    setApkCheckInfo(null);
+    return () => {
+      if (completedArtifact?.blobUrl) {
+        URL.revokeObjectURL(completedArtifact.blobUrl);
+      }
+    };
+  }, [completedArtifact]);
+
+  useEffect(() => {
+    setInstallState({ stage: 'idle', percent: 0, downloadedBytes: 0, totalBytes: 0 });
+    setCompletedArtifact(null);
+    setInstallerLaunchedNotice(null);
     setShowQrPanel(false);
     setBrokenShots({});
     setConfirmDelete(false);
@@ -140,15 +174,19 @@ export function AppDetailView({
     if (!showQrPanel) return;
     let cancelled = false;
     (async () => {
-      let qrTarget = permanentAppUrl;
-      try {
-        const res = await fetch('./api/health');
-        const ct = res.headers.get('content-type') || '';
-        if (res.ok && ct.includes('application/json')) {
-          qrTarget = `${window.location.origin}/api/apps/${encodeURIComponent(app.id)}/install-apk`;
+      let qrTarget = shortAppUrl;
+      if (serverOnline) {
+        qrTarget = `${window.location.origin}/api/apps/${encodeURIComponent(app.id)}/install-apk?mode=open`;
+      } else {
+        try {
+          const res = await fetch('./api/health');
+          const ct = res.headers.get('content-type') || '';
+          if (res.ok && ct.includes('application/json')) {
+            qrTarget = `${window.location.origin}/api/apps/${encodeURIComponent(app.id)}/install-apk?mode=open`;
+          }
+        } catch {
+          // Static fallback URL already selected
         }
-      } catch {
-        // Static fallback URL already selected
       }
       if (cancelled) return;
       QRCode.toDataURL(qrTarget, {
@@ -166,171 +204,71 @@ export function AppDetailView({
     return () => {
       cancelled = true;
     };
-  }, [showQrPanel, app.id, permanentAppUrl]);
+  }, [showQrPanel, app.id, shortAppUrl, serverOnline]);
 
   const handleDirectInstall = async () => {
-    if (installPhase === 'verifying') return;
-    setInstallPhase('verifying');
-    setInstallError(null);
-    setInstallProgress(20);
-
-    let backendOnline = false;
-    let verified = false;
-
-    let resolvedExternalUrl: string | null = null;
-    let resolvedSha256: string | null = app.apkSha256 || null;
-
-    try {
-      const verifyRes = await fetch(`./api/apps/${encodeURIComponent(app.id)}/verify-apk`);
-      const ct = verifyRes.headers.get('content-type') || '';
-      if (ct.includes('application/json')) {
-        backendOnline = true;
-        if (!verifyRes.ok) {
-          setInstallPhase('error');
-          setInstallError('تعذر العثور على حزمة APK الخاصة بهذا التطبيق.');
-          return;
-        }
-        const vData = (await verifyRes.json()) as {
-          valid: boolean;
-          isBinaryManifest: boolean;
-          isSignedApk: boolean;
-          signatureScheme?: string | null;
-          signerCertSha256?: string | null;
-          sha256?: string | null;
-          externalApkUrl?: string | null;
-          hasCustomApk?: boolean;
-        };
-        if (!vData.valid) {
-          setInstallPhase('error');
-          setInstallError('ملف APK تالف أو غير مكتمل، تم إيقاف التثبيت لحماية جهازك.');
-          return;
-        }
-        resolvedExternalUrl = !vData.hasCustomApk && vData.externalApkUrl ? vData.externalApkUrl : null;
-        resolvedSha256 = vData.sha256 || app.apkSha256 || null;
-        setApkCheckInfo({
-          isBinaryManifest: Boolean(vData.isBinaryManifest),
-          isSignedApk: Boolean(vData.isSignedApk),
-          signatureScheme: vData.signatureScheme || app.signatureScheme || null,
-          signerCertSha256: vData.signerCertSha256 || app.signerCertSha256 || null,
-          sha256: resolvedSha256,
-          externalApkUrl: vData.externalApkUrl || app.externalApkUrl || null,
-          viaBlob: false,
-        });
-        verified = true;
-      }
-    } catch {
-      backendOnline = false;
-    }
-
-    if (!backendOnline) {
-      const hasLocalBlob = await localHasStoredApkBlob(app.id);
-      const safeExternal =
-        app.externalApkUrl && /^https:\/\/[^\s@]+$/.test(app.externalApkUrl)
-          ? app.externalApkUrl
-          : null;
-      if (app.hasCustomApk && !safeExternal && !hasLocalBlob) {
-        setInstallPhase('error');
-        setInstallError(
-          'تعذر العثور على حزمة APK على الخادم؛ هذا التطبيق منشور من جهاز آخر على الاستضافة الثابتة دون رابط HTTPS مباشر. يرجى من المطور إضافة رابط تنزيل APK مباشر (HTTPS) أو النشر عبر خادم Play55 الكامل.'
-        );
-        return;
-      }
-      const localCheck = await localVerifyApkBlob(app);
-      if (!localCheck.valid) {
-        setInstallPhase('error');
-        setInstallError('ملف APK تالف أو غير مكتمل، يرجى من المطور إعادة رفع حزمة صالحة.');
-        return;
-      }
-      resolvedExternalUrl = localCheck.externalApkUrl || safeExternal || null;
-      resolvedSha256 = localCheck.sha256 || app.apkSha256 || null;
-      setApkCheckInfo({
-        isBinaryManifest: localCheck.isBinaryManifest,
-        isSignedApk: localCheck.isSignedApk,
-        signatureScheme: localCheck.signatureScheme || app.signatureScheme || null,
-        signerCertSha256: app.signerCertSha256 || null,
-        sha256: resolvedSha256,
-        externalApkUrl: resolvedExternalUrl,
-        viaBlob: !resolvedExternalUrl,
-      });
-      verified = true;
-    }
-
-    if (!verified) {
-      setInstallPhase('error');
-      setInstallError('تعذر التحقق من سلامة ملف APK.');
+    if (
+      installState.stage === 'verifying' ||
+      installState.stage === 'downloading' ||
+      installState.stage === 'launching'
+    ) {
       return;
     }
+    setInstallerLaunchedNotice(null);
+    const artifact = await runDirectApkInstall(
+      app,
+      (nextState) => setInstallState(nextState),
+      (nextDownloads) => onAppUpdated({ ...app, downloads: nextDownloads })
+    );
+    if (!artifact) return;
 
-    setInstallProgress(65);
-
-    if (backendOnline) {
-      try {
-        const res = await fetch(`./api/apps/${encodeURIComponent(app.id)}/install`, {
-          method: 'POST',
-        });
-        const contentType = res.headers.get('content-type') || '';
-        if (res.ok && contentType.includes('application/json')) {
-          const data = (await res.json()) as { downloads: number };
-          onAppUpdated({ ...app, downloads: data.downloads });
-        }
-      } catch {
-        // Non-blocking counter update
-      }
-    } else {
-      const nextDownloads = await localIncrementInstall(app).catch(() => app.downloads + 1);
-      onAppUpdated({ ...app, downloads: nextDownloads });
-    }
-
-    let localApkBlob: Blob | null = null;
-    if (!backendOnline && !resolvedExternalUrl) {
-      localApkBlob = await localBuildOrFetchApkBlob(app);
-    }
-
-    setInstallProgress(100);
-    setInstallPhase('handoff');
-
-    if (resolvedExternalUrl) {
-      const link = document.createElement('a');
-      link.href = resolvedExternalUrl;
-      link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
-      link.rel = 'noopener noreferrer';
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-    } else if (backendOnline) {
-      const installEndpoint = `./api/apps/${encodeURIComponent(app.id)}/install-apk`;
-      const link = document.createElement('a');
-      link.href = installEndpoint;
-      link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-    } else if (localApkBlob) {
-      const blobUrl = URL.createObjectURL(localApkBlob);
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      window.setTimeout(() => URL.revokeObjectURL(blobUrl), 60_000);
-    }
-
-    recordAppDownload(app, resolvedSha256);
-
+    setCompletedArtifact(artifact);
     const isAndroid = /android/i.test(navigator.userAgent);
     if (!isAndroid) {
       setShowQrPanel(true);
     }
   };
 
-  const handleShare = async () => {
+  const handleLaunchInstallerNow = async () => {
+    if (!completedArtifact) return;
+    const method = await openApkInAndroidInstaller(completedArtifact);
+    if (method === 'shared') {
+      setInstallerLaunchedNotice('تم إرسال ملف APK مباشرة إلى مُثبّت حزم النظام.');
+    } else if (method === 'intent') {
+      setInstallerLaunchedNotice('تم تشغيل مُثبّت Android للحزمة مباشرة.');
+    } else {
+      setInstallerLaunchedNotice('تم فتح حزمة APK — اضغط «فتح» لتشغيل مُثبّت التطبيقات فوراً.');
+    }
+  };
+
+  const handleCopyShortUrl = async () => {
     try {
-      await navigator.clipboard.writeText(permanentAppUrl);
+      await navigator.clipboard.writeText(shortAppUrl);
       setCopiedShare(true);
       window.setTimeout(() => setCopiedShare(false), 2500);
     } catch {
       setCopiedShare(false);
+    }
+  };
+
+  const handleShareWithImage = async () => {
+    setShareImageStatus(null);
+    try {
+      const outcome = await shareShortLinkWithAppImage(app, shortAppUrl);
+      if (outcome === 'shared-with-image') {
+        setShareImageStatus('تمت مشاركة الرابط القصير مع صورة التطبيق');
+      } else if (outcome === 'shared-link') {
+        setShareImageStatus('تمت مشاركة الرابط القصير بنجاح');
+      } else {
+        setCopiedShare(true);
+        setShareImageStatus('تم نسخ الرابط القصير');
+      }
+      window.setTimeout(() => {
+        setShareImageStatus(null);
+        setCopiedShare(false);
+      }, 2800);
+    } catch {
+      // User cancelled native share sheet
     }
   };
 
@@ -581,49 +519,69 @@ export function AppDetailView({
 
         {/* Direct Install & Share Action Column */}
         <div className="flex flex-col sm:flex-row lg:flex-col items-stretch sm:items-center lg:items-end gap-3 shrink-0 lg:min-w-[270px]">
-          <button
-            type="button"
-            onClick={handleDirectInstall}
-            disabled={installPhase === 'verifying'}
-            className={`w-full inline-flex items-center justify-center gap-2.5 px-7 py-3.5 text-sm font-semibold rounded-xl transition-colors shadow-xs disabled:opacity-80 focus-visible:outline-2 focus-visible:outline-offset-2 ${
-              hasNewUpdate
-                ? 'bg-[#0B57D0] hover:bg-[#0842A0] text-white focus-visible:outline-[#0B57D0]'
-                : alreadyInstalledLatest && installPhase !== 'handoff'
-                ? 'bg-[#E6F4EA] hover:bg-[#D5ECD9] text-[#01875F] border border-[#01875F]/25 focus-visible:outline-[#01875F]'
-                : 'bg-[#01875F] hover:bg-[#016E4D] text-white focus-visible:outline-[#01875F]'
-            }`}
-          >
-            {installPhase === 'verifying' ? (
-              <>
-                <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
-                <span className="tabular-nums">جاري فحص ملف APK ({installProgress}%)</span>
-              </>
-            ) : installPhase === 'handoff' ? (
-              <>
-                {hasNewUpdate ? <RefreshCw className="w-4 h-4" /> : <Download className="w-4 h-4" />}
-                <span>تنزيل حزمة APK مجدداً</span>
-              </>
-            ) : hasNewUpdate ? (
-              <>
-                <RefreshCw className="w-4 h-4" />
-                <span>تحديث (v{app.versionName})</span>
-              </>
-            ) : alreadyInstalledLatest ? (
-              <>
-                <CheckCircle2 className="w-4 h-4" />
-                <span>تم التنزيل — إعادة تنزيل</span>
-              </>
-            ) : (
-              <>
-                <Download className="w-4 h-4" />
-                <span>تنزيل التطبيق</span>
-              </>
-            )}
-          </button>
+          {(() => {
+            const isBusy =
+              installState.stage === 'verifying' ||
+              installState.stage === 'downloading' ||
+              installState.stage === 'launching';
+            return (
+              <button
+                type="button"
+                onClick={handleDirectInstall}
+                disabled={isBusy}
+                className={`w-full inline-flex items-center justify-center gap-2.5 px-7 py-3.5 text-sm font-semibold rounded-xl transition-colors shadow-xs disabled:opacity-80 focus-visible:outline-2 focus-visible:outline-offset-2 ${
+                  hasNewUpdate
+                    ? 'bg-[#0B57D0] hover:bg-[#0842A0] text-white focus-visible:outline-[#0B57D0]'
+                    : alreadyInstalledLatest && installState.stage !== 'ready'
+                    ? 'bg-[#E6F4EA] hover:bg-[#D5ECD9] text-[#01875F] border border-[#01875F]/25 focus-visible:outline-[#01875F]'
+                    : 'bg-[#01875F] hover:bg-[#016E4D] text-white focus-visible:outline-[#01875F]'
+                }`}
+              >
+                {installState.stage === 'verifying' ? (
+                  <>
+                    <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+                    <span className="tabular-nums">جاري فحص حزمة APK ({installState.percent}%)</span>
+                  </>
+                ) : installState.stage === 'downloading' ? (
+                  <>
+                    <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+                    <span className="tabular-nums">
+                      جاري التنزيل للتثبيت المباشر ({installState.percent}%)
+                    </span>
+                  </>
+                ) : installState.stage === 'launching' ? (
+                  <>
+                    <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin" />
+                    <span>اكتمل التنزيل — جاري التثبيت...</span>
+                  </>
+                ) : installState.stage === 'ready' ? (
+                  <>
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>{hasNewUpdate ? 'تحديث وتثبيت مجدداً' : 'تم التحميل — إعادة التثبيت'}</span>
+                  </>
+                ) : hasNewUpdate ? (
+                  <>
+                    <RefreshCw className="w-4 h-4" />
+                    <span>تحديث وتثبيت (v{app.versionName})</span>
+                  </>
+                ) : alreadyInstalledLatest ? (
+                  <>
+                    <CheckCircle2 className="w-4 h-4" />
+                    <span>إعادة تثبيت التطبيق</span>
+                  </>
+                ) : (
+                  <>
+                    <Download className="w-4 h-4" />
+                    <span>تثبيت التطبيق</span>
+                  </>
+                )}
+              </button>
+            );
+          })()}
 
           {hasNewUpdate && downloadInfo.previousRecord && (
             <p className="text-[11px] font-medium text-[#0B57D0] bg-[#E8F0FE] border border-[#0B57D0]/20 rounded-lg px-3 py-1.5 w-full text-center">
-              يتوفر تحديث جديد منذ آخر تنزيل لك: لديك{' '}
+              يتوفر تحديث جديد منذ آخر تثبيت لك: لديك{' '}
               <span dir="ltr" className="font-mono font-bold">v{downloadInfo.previousRecord.versionName}</span>
               {' ← '}
               <span dir="ltr" className="font-mono font-bold">v{app.versionName}</span>
@@ -641,48 +599,77 @@ export function AppDetailView({
             </button>
             <button
               type="button"
-              onClick={handleShare}
+              onClick={handleShareWithImage}
               className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 text-xs font-medium text-[#202124] bg-[#F8F9FA] hover:bg-[#F1F3F4] border border-[#E8EAED] rounded-xl transition-colors whitespace-nowrap"
             >
-              <Share2 className="w-4 h-4 text-[#5F6368]" />
-              <span>{copiedShare ? 'تم النسخ' : 'نسخ الرابط'}</span>
+              <Share2 className="w-4 h-4 text-[#01875F]" />
+              <span>{shareImageStatus ? 'تمت المشاركة' : 'مشاركة + صورة'}</span>
             </button>
           </div>
         </div>
       </section>
 
-      {/* Permanent Independent App Link Bar */}
-      <section className="p-4 bg-[#F8F9FA] border border-[#E8EAED] rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <div className="flex items-center gap-2.5 min-w-0">
-          <Link2 className="w-4 h-4 text-[#01875F] shrink-0" />
-          <span className="text-xs font-semibold text-[#202124] shrink-0">الرابط المباشر الدائم للتطبيق:</span>
-          <code className="text-xs font-mono text-[#5F6368] truncate" dir="ltr">
-            {permanentAppUrl}
-          </code>
+      {/* Short Direct Link Card with Attached App Image Preview */}
+      <section className="p-4 sm:p-5 bg-[#F8F9FA] border border-[#E8EAED] rounded-2xl flex flex-col md:flex-row md:items-center justify-between gap-4">
+        <div className="flex items-center gap-3.5 min-w-0">
+          <AppIcon
+            src={app.iconUrl}
+            alt={app.name}
+            className="w-12 h-12 rounded-xl shrink-0 border border-[#E8EAED] bg-white"
+          />
+          <div className="min-w-0 space-y-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <Link2 className="w-3.5 h-3.5 text-[#01875F] shrink-0" />
+              <span className="text-xs font-bold text-[#202124]">
+                الرابط القصير المباشر مع صورة التطبيق:
+              </span>
+              <span className="text-[11px] font-medium text-[#01875F] bg-[#E6F4EA] px-2 py-0.5 rounded-md">
+                {app.name} · v{app.versionName}
+              </span>
+            </div>
+            <code className="block text-xs font-mono text-[#5F6368] truncate" dir="ltr">
+              {shortAppUrl}
+            </code>
+          </div>
         </div>
-        <button
-          type="button"
-          onClick={handleShare}
-          className="inline-flex items-center justify-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-[#01875F] bg-white border border-[#DADCE0] hover:bg-[#F1F3F4] rounded-lg transition-colors shrink-0"
-        >
-          <Copy className="w-3.5 h-3.5" />
-          <span>{copiedShare ? 'تم نسخ الرابط الدائم' : 'نسخ الرابط'}</span>
-        </button>
+
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <button
+            type="button"
+            onClick={handleCopyShortUrl}
+            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-[#202124] bg-white border border-[#DADCE0] hover:bg-[#F1F3F4] rounded-xl transition-colors"
+          >
+            <Copy className="w-3.5 h-3.5 text-[#01875F]" />
+            <span>{copiedShare ? 'تم نسخ الرابط القصير' : 'نسخ الرابط القصير'}</span>
+          </button>
+          <button
+            type="button"
+            onClick={handleShareWithImage}
+            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] rounded-xl transition-colors"
+          >
+            <Share2 className="w-3.5 h-3.5" />
+            <span>{shareImageStatus || 'مشاركة مع الصورة'}</span>
+          </button>
+        </div>
       </section>
 
       {/* Install Error Banner */}
-      {installPhase === 'error' && installError && (
+      {installState.stage === 'error' && installState.error && (
         <section className="p-5 bg-red-50 border border-red-200 rounded-2xl flex items-start gap-3">
           <AlertTriangle className="w-5 h-5 text-red-600 shrink-0 mt-0.5" />
           <div className="space-y-1">
             <h3 className="text-sm font-bold text-red-800">تعذر متابعة تثبيت الحزمة</h3>
-            <p className="text-xs text-red-700 leading-relaxed">{installError}</p>
+            <p className="text-xs text-red-700 leading-relaxed">{installState.error}</p>
           </div>
         </section>
       )}
 
-      {/* Install Progress, Android Official Installer Guide & QR Phone Handoff Notice */}
-      {(installPhase === 'verifying' || installPhase === 'handoff' || showQrPanel) && (
+      {/* Install Progress, Auto Post-Download Installer Launcher & QR Phone Handoff Notice */}
+      {(installState.stage === 'verifying' ||
+        installState.stage === 'downloading' ||
+        installState.stage === 'launching' ||
+        installState.stage === 'ready' ||
+        showQrPanel) && (
         <section className="p-5 sm:p-6 bg-[#F8F9FA] border border-[#E8EAED] rounded-2xl flex flex-col md:flex-row items-start md:items-center justify-between gap-6">
           <div className="space-y-3 flex-1">
             <div className="flex items-center gap-3">
@@ -695,29 +682,33 @@ export function AppDetailView({
                 <div className="flex items-center gap-2 text-sm font-semibold text-[#202124]">
                   <ShieldCheck className="w-4 h-4 text-[#01875F] shrink-0" />
                   <span>
-                    {installPhase === 'handoff'
-                      ? `تم فحص ملف APK وتجهيزه لفتح مُثبّت Android الرسمي — ${app.name} (v${app.versionName})`
-                      : installPhase === 'verifying'
+                    {installState.stage === 'ready'
+                      ? `اكتمل تنزيل APK وجاري فتح مُثبّت Android مباشرة — ${app.name} (v${app.versionName})`
+                      : installState.stage === 'downloading'
+                      ? `جاري تنزيل حزمة ${app.name} لتشغيل التثبيت التلقائي (${installState.percent}%)...`
+                      : installState.stage === 'launching'
+                      ? `اكتمل التنزيل! جاري تحويل الحزمة إلى مُثبّت النظام...`
+                      : installState.stage === 'verifying'
                       ? `جاري فحص سلامة ملف APK الخاص بتطبيق ${app.name}...`
                       : `التثبيت المباشر لتطبيق ${app.name} (v${app.versionName})`}
                   </span>
                 </div>
-                {apkCheckInfo && (
+                {completedArtifact?.apkCheckInfo && (
                   <div className="space-y-0.5 mt-1">
                     <p className="text-xs text-[#01875F] font-medium">
                       تم التحقق من سلامة بنية APK بنجاح
-                      {apkCheckInfo.isSignedApk
-                        ? ` · حزمة موقّعة رقمياً (${apkCheckInfo.signatureScheme || 'APK Signature'})`
+                      {completedArtifact.apkCheckInfo.isSignedApk
+                        ? ` · حزمة موقّعة رقمياً (${completedArtifact.apkCheckInfo.signatureScheme || 'APK Signature'})`
                         : ' · تنبيه: لم يُرصد توقيع رقمي داخل الحزمة'}
                     </p>
-                    {apkCheckInfo.sha256 && (
+                    {completedArtifact.apkCheckInfo.sha256 && (
                       <p className="text-[11px] font-mono text-[#5F6368] break-all" dir="ltr">
-                        SHA-256: {apkCheckInfo.sha256}
+                        SHA-256: {completedArtifact.apkCheckInfo.sha256}
                       </p>
                     )}
-                    {apkCheckInfo.signerCertSha256 && (
+                    {completedArtifact.apkCheckInfo.signerCertSha256 && (
                       <p className="text-[11px] font-mono text-[#5F6368] break-all" dir="ltr">
-                        Signer Cert SHA-256: {apkCheckInfo.signerCertSha256}
+                        Signer Cert SHA-256: {completedArtifact.apkCheckInfo.signerCertSha256}
                       </p>
                     )}
                   </div>
@@ -725,33 +716,61 @@ export function AppDetailView({
               </div>
             </div>
 
-            {installPhase === 'verifying' && (
-              <div className="w-full max-w-md h-2 bg-[#E8EAED] rounded-full overflow-hidden">
-                <div
-                  className="h-full bg-[#01875F] transition-all duration-150"
-                  style={{ width: `${installProgress}%` }}
-                />
+            {(installState.stage === 'verifying' ||
+              installState.stage === 'downloading' ||
+              installState.stage === 'launching') && (
+              <div className="space-y-1.5 max-w-md">
+                <div className="w-full h-2.5 bg-[#E8EAED] rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-[#01875F] transition-all duration-150"
+                    style={{ width: `${installState.percent}%` }}
+                  />
+                </div>
+                {installState.totalBytes > 0 && (
+                  <p className="text-[11px] text-[#5F6368] tabular-nums" dir="ltr">
+                    {(installState.downloadedBytes / 1048576).toFixed(2)} MB /{' '}
+                    {(installState.totalBytes / 1048576).toFixed(2)} MB ({installState.percent}%)
+                  </p>
+                )}
+              </div>
+            )}
+
+            {installState.stage === 'ready' && completedArtifact && (
+              <div className="flex flex-wrap items-center gap-2.5 pt-1">
+                <button
+                  type="button"
+                  onClick={() => void handleLaunchInstallerNow()}
+                  className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] rounded-xl transition-colors shadow-xs"
+                >
+                  <Smartphone className="w-4 h-4" />
+                  <span>فتح مُثبّت الحزم الآن (دون دخول ملفات الهاتف)</span>
+                </button>
+                {installerLaunchedNotice && (
+                  <span className="text-xs font-medium text-[#01875F]">
+                    {installerLaunchedNotice}
+                  </span>
+                )}
               </div>
             )}
 
             <div className="p-3.5 bg-white border border-[#E8EAED] rounded-xl space-y-2 text-xs text-[#3C4043] leading-relaxed">
               <p className="font-semibold text-[#202124]">
-                خطوات إكمال التثبيت على هاتف Android بأمان:
+                التثبيت المباشر فور اكتمال التحميل:
               </p>
               <ol className="list-decimal list-inside space-y-1 text-[#5F6368]">
                 <li>
-                  عند ظهور رسالة متصفح Chrome المعتادة («قد يكون هذا الملف ضارًا»)، فهذا تنبيه أمني عام يظهر تلقائياً لجميع ملفات <span dir="ltr" className="font-mono">.apk</span> المنزّلة من خارج Google Play عندما تكون الحزمة جديدة في قاعدة سمعة Safe Browsing؛ اختر <strong>«التنزيل على أي حال»</strong> للمتابعة إذا كنت تثق بالمطور.
+                  فور وصول التحميل إلى 100% يتم تمرير ملف APK تلقائياً إلى المتصفح والنظام؛ اضغط <strong>«فتح»</strong> في الشريط الفوري الظاهر بالأسفل أو زر <strong>«فتح مُثبّت الحزم الآن»</strong> أعلاه دون الحاجة لفتح مدير ملفات الهاتف.
                 </li>
                 <li>
-                  عند اكتمال التنزيل، اضغط على <strong>«فتح»</strong> لتشغيل واجهة مُثبّت حزم Android الرسمية.
+                  عند ظهور رسالة المتصفح المعتادة («قد يكون هذا الملف ضارًا»)، اختر <strong>«التنزيل على أي حال»</strong> إذا كنت تثق بالمطور.
                 </li>
                 <li>
-                  إذا طلب النظام إذن التثبيت من مصادر خارجية، اختر <strong>«الإعدادات»</strong> ← فعّل <strong>«السماح من هذا المصدر»</strong> للمتصفح، ثم ارجع واضغط <strong>«تثبيت»</strong>.
+                  إذا طلب النظام إذن التثبيت من مصادر خارجية، اختر <strong>«الإعدادات»</strong> ← فعّل <strong>«السماح من هذا المصدر»</strong>، ثم اضغط <strong>«تثبيت»</strong>.
                 </li>
               </ol>
-              {apkCheckInfo?.viaBlob && (
+              {completedArtifact?.apkCheckInfo?.viaBlob && (
                 <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2">
-                  ملاحظة الاستضافة: يتم التنزيل حالياً من ذاكرة المتصفح المحلية على الاستضافة الثابتة؛ للحصول على رابط HTTPS مباشر عابر للأجهزة وتقليل تحذيرات التنزيل، يُنصح برفع التطبيق عبر خادم Play55 الكامل أو إضافة رابط توزيع HTTPS موثوق.
+                  ملاحظة الاستضافة: تم تجهيز الحزمة من الذاكرة المحلية على الاستضافة الثابتة؛ للحصول على رابط HTTPS مباشر عابر للأجهزة وتقليل تحذيرات التنزيل، يُنصح برفع التطبيق عبر خادم Play55 الكامل أو إضافة رابط توزيع HTTPS موثوق.
                 </p>
               )}
             </div>
