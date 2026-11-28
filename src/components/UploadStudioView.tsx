@@ -123,6 +123,7 @@ export function UploadStudioView({
   const [versionCode, setVersionCode] = useState('');
   const [minAndroid, setMinAndroid] = useState('Android 8.0+');
   const [ageRating, setAgeRating] = useState('+3');
+  const [externalApkUrl, setExternalApkUrl] = useState('');
 
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
@@ -161,6 +162,7 @@ export function UploadStudioView({
       setVersionCode(editingApp.versionCode);
       setMinAndroid(editingApp.minAndroid);
       setAgeRating(editingApp.ageRating);
+      setExternalApkUrl(editingApp.externalApkUrl || '');
     }
   }, [editingApp]);
 
@@ -197,6 +199,7 @@ export function UploadStudioView({
     setVersionCode('');
     setMinAndroid('Android 8.0+');
     setAgeRating('+3');
+    setExternalApkUrl('');
   };
 
   const processApkFile = async (file: File) => {
@@ -343,6 +346,20 @@ export function UploadStudioView({
       return;
     }
 
+    const trimmedExternalUrl = externalApkUrl.trim();
+    if (trimmedExternalUrl) {
+      try {
+        const parsed = new URL(trimmedExternalUrl);
+        if (parsed.protocol !== 'https:' || parsed.username || parsed.password) {
+          setError('رابط التوزيع الخارجي يجب أن يبدأ ببروتوكول HTTPS الآمن فقط.');
+          return;
+        }
+      } catch {
+        setError('يرجى إدخال رابط HTTPS صحيح لملف APK الخارجي أو تركه فارغاً.');
+        return;
+      }
+    }
+
     let idToken: string | null = null;
     try {
       idToken = await getAuthToken();
@@ -385,6 +402,7 @@ export function UploadStudioView({
     );
     formData.append('minAndroid', minAndroid.trim() || editingApp?.minAndroid || 'Android 8.0+');
     formData.append('ageRating', ageRating);
+    formData.append('externalApkUrl', trimmedExternalUrl);
     if (extracted) {
       formData.append('sizeMB', String(extracted.sizeMB || 1));
       formData.append('permissionsCount', String(extracted.permissionsCount || 0));
@@ -426,6 +444,8 @@ export function UploadStudioView({
               sizeMB: extracted?.sizeMB,
               isBinaryManifest: extracted?.isBinaryManifest,
               isSignedApk: extracted?.isSignedApk,
+              apkSha256: extracted?.apkSha256,
+              externalApkUrl: trimmedExternalUrl,
               permissionsCount: extracted?.permissionsCount,
               owner: user,
             })
@@ -447,6 +467,8 @@ export function UploadStudioView({
               sizeMB: extracted?.sizeMB || 1,
               isBinaryManifest: extracted?.isBinaryManifest,
               isSignedApk: extracted?.isSignedApk,
+              apkSha256: extracted?.apkSha256,
+              externalApkUrl: trimmedExternalUrl || undefined,
               permissionsCount: extracted?.permissionsCount || 0,
               owner: user,
             });
@@ -1095,10 +1117,19 @@ export function UploadStudioView({
                           {extracted?.minAndroid}
                         </p>
                         {extracted?.isValidZipApk && (
-                          <p className="text-[#01875F] font-medium">
-                            حزمة APK سليمة ومكتملة
-                            {extracted.isSignedApk ? ' · موقّعة رقمياً' : ''}
-                          </p>
+                          <div className="space-y-0.5 pt-1">
+                            <p className={extracted.isSignedApk ? 'text-[#01875F] font-medium' : 'text-amber-700 font-medium'}>
+                              حزمة APK سليمة ومكتملة
+                              {extracted.isSignedApk
+                                ? ' · موقّعة رقمياً (Android Signature)'
+                                : ' · تنبيه: الحزمة غير موقّعة رقمياً (قد يرفضها Android)'}
+                            </p>
+                            {extracted.apkSha256 && (
+                              <p className="font-mono text-[11px] text-[#5F6368] break-all" dir="ltr">
+                                SHA-256: {extracted.apkSha256}
+                              </p>
+                            )}
+                          </div>
                         )}
                       </div>
                     )}
@@ -1316,6 +1347,24 @@ export function UploadStudioView({
               placeholder="مثال: تحسين سرعة الإقلاع وإصلاح بعض الأخطاء..."
               className="w-full px-3.5 py-2.5 text-sm bg-white border border-[#DADCE0] rounded-xl focus:outline-none focus:border-[#01875F]"
             />
+          </div>
+
+          <div>
+            <label htmlFor="app-external-apk" className="block text-xs font-semibold text-[#3C4043] mb-1.5">
+              رابط استضافة APK مباشر عبر HTTPS (اختياري — للتوزيع عبر خادم/CDN موثوق)
+            </label>
+            <input
+              id="app-external-apk"
+              type="url"
+              dir="ltr"
+              value={externalApkUrl}
+              onChange={(e) => setExternalApkUrl(e.target.value)}
+              placeholder="https://github.com/user/repo/releases/download/v1.2/app.apk"
+              className="w-full px-3.5 py-2.5 text-sm font-mono bg-white border border-[#DADCE0] rounded-xl focus:outline-none focus:border-[#01875F]"
+            />
+            <p className="mt-1.5 text-[11px] text-[#5F6368] leading-relaxed">
+              يُفضّل إضافة رابط HTTPS مباشر عند النشر على استضافة ثابتة لضمان عدم التنزيل عبر ذاكرة المتصفح المؤقتة (Blob) وإمكانية التنزيل من أي جهاز برابط موثوق.
+            </p>
           </div>
         </section>
 

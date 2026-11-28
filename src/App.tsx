@@ -457,6 +457,7 @@ export default function App() {
       backendOnline = false;
     }
 
+    let resolvedExternalUrl: string | null = null;
     if (!backendOnline) {
       const localCheck = await localVerifyApkBlob(app);
       if (!localCheck.valid) {
@@ -464,6 +465,7 @@ export default function App() {
         setQuickInstallError(`تعذر تثبيت «${app.name}»: ملف APK تالف أو غير مكتمل.`);
         return;
       }
+      resolvedExternalUrl = localCheck.externalApkUrl || null;
       verified = true;
     }
 
@@ -473,7 +475,15 @@ export default function App() {
       return;
     }
 
-    if (backendOnline) {
+    if (resolvedExternalUrl) {
+      const link = document.createElement('a');
+      link.href = resolvedExternalUrl;
+      link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
+      link.rel = 'noopener noreferrer';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } else if (backendOnline) {
       try {
         const res = await fetch(`./api/apps/${encodeURIComponent(app.id)}/install`, {
           method: 'POST',

@@ -463,6 +463,21 @@ export async function localClearSession(): Promise<void> {
   }
 }
 
+function sanitizeHttpsApkUrlClient(raw?: string): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 500) return undefined;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password) {
+      return undefined;
+    }
+    return parsed.toString();
+  } catch {
+    return undefined;
+  }
+}
+
 export async function localPublishApp(params: {
   apkFile: File;
   iconSource: Blob | null;
@@ -481,6 +496,8 @@ export async function localPublishApp(params: {
   sizeMB: number;
   isBinaryManifest?: boolean;
   isSignedApk?: boolean;
+  apkSha256?: string;
+  externalApkUrl?: string;
   permissionsCount: number;
   owner: DeveloperSessionUser;
 }): Promise<StoreApp> {
@@ -518,6 +535,8 @@ export async function localPublishApp(params: {
     hasCustomApk: true,
     isBinaryManifest: params.isBinaryManifest,
     isSignedApk: params.isSignedApk,
+    apkSha256: params.apkSha256,
+    externalApkUrl: sanitizeHttpsApkUrlClient(params.externalApkUrl),
     permissionsCount: params.permissionsCount,
     downloads: 1,
     averageRating: 0,
@@ -554,6 +573,8 @@ export async function localUpdateApp(params: {
   sizeMB?: number;
   isBinaryManifest?: boolean;
   isSignedApk?: boolean;
+  apkSha256?: string;
+  externalApkUrl?: string;
   permissionsCount?: number;
   owner: DeveloperSessionUser;
 }): Promise<StoreApp> {
@@ -579,6 +600,13 @@ export async function localUpdateApp(params: {
     await idbPut(db, 'apkBlobs', { appId: params.existingApp.id, blob: params.apkFile });
   }
 
+  const nextExternalUrl =
+    typeof params.externalApkUrl === 'string'
+      ? params.externalApkUrl.trim() === ''
+        ? undefined
+        : sanitizeHttpsApkUrlClient(params.externalApkUrl) ?? params.existingApp.externalApkUrl
+      : params.existingApp.externalApkUrl;
+
   const updatedApp: StoreApp = {
     ...params.existingApp,
     name: params.name.trim() || params.existingApp.name,
@@ -599,6 +627,8 @@ export async function localUpdateApp(params: {
     hasCustomApk: params.existingApp.hasCustomApk || Boolean(params.apkFile),
     isBinaryManifest: params.isBinaryManifest ?? params.existingApp.isBinaryManifest,
     isSignedApk: params.isSignedApk ?? params.existingApp.isSignedApk,
+    apkSha256: params.apkSha256 ?? params.existingApp.apkSha256,
+    externalApkUrl: nextExternalUrl,
     permissionsCount: params.permissionsCount ?? params.existingApp.permissionsCount,
     updatedAt: new Date().toISOString(),
   };
@@ -611,8 +641,21 @@ export async function localVerifyApkBlob(app: StoreApp): Promise<{
   valid: boolean;
   isBinaryManifest: boolean;
   isSignedApk: boolean;
+  sha256?: string;
+  externalApkUrl?: string;
   hasCustomApk: boolean;
 }> {
+  const safeExternalUrl = sanitizeHttpsApkUrlClient(app.externalApkUrl);
+  if (safeExternalUrl && !app.apkFilename) {
+    return {
+      valid: true,
+      isBinaryManifest: Boolean(app.isBinaryManifest),
+      isSignedApk: Boolean(app.isSignedApk),
+      sha256: app.apkSha256,
+      externalApkUrl: safeExternalUrl,
+      hasCustomApk: app.hasCustomApk,
+    };
+  }
   const blob = await localBuildOrFetchApkBlob(app);
   try {
     const buf = await blob.arrayBuffer();
@@ -633,10 +676,17 @@ export async function localVerifyApkBlob(app: StoreApp): Promise<{
     const mBuf = await manifest.async('arraybuffer');
     const isBinaryManifest = mBuf.byteLength >= 4 && new DataView(mBuf).getUint16(0, true) === 0x0003;
     const hasCert = Object.keys(zip.files).some((n) => /^META-INF\/.+\.(RSA|DSA|EC|SF)$/i.test(n));
+    let sha256 = app.apkSha256;
+    if (!sha256 && typeof globalThis.crypto?.subtle?.digest === 'function') {
+      const digest = await globalThis.crypto.subtle.digest('SHA-256', buf);
+      sha256 = bytesToHex(new Uint8Array(digest));
+    }
     return {
       valid: true,
       isBinaryManifest,
       isSignedApk: hasCert || Boolean(app.isSignedApk),
+      sha256,
+      externalApkUrl: safeExternalUrl,
       hasCustomApk: app.hasCustomApk,
     };
   } catch {

@@ -75,6 +75,9 @@ export function AppDetailView({
   const [apkCheckInfo, setApkCheckInfo] = useState<{
     isBinaryManifest: boolean;
     isSignedApk: boolean;
+    sha256?: string | null;
+    externalApkUrl?: string | null;
+    viaBlob?: boolean;
   } | null>(null);
   const [showQrPanel, setShowQrPanel] = useState(false);
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
@@ -145,6 +148,8 @@ export function AppDetailView({
     let backendOnline = false;
     let verified = false;
 
+    let resolvedExternalUrl: string | null = null;
+
     try {
       const verifyRes = await fetch(`./api/apps/${encodeURIComponent(app.id)}/verify-apk`);
       const ct = verifyRes.headers.get('content-type') || '';
@@ -159,15 +164,22 @@ export function AppDetailView({
           valid: boolean;
           isBinaryManifest: boolean;
           isSignedApk: boolean;
+          sha256?: string | null;
+          externalApkUrl?: string | null;
+          hasCustomApk?: boolean;
         };
         if (!vData.valid) {
           setInstallPhase('error');
           setInstallError('ملف APK تالف أو غير مكتمل، تم إيقاف التثبيت لحماية جهازك.');
           return;
         }
+        resolvedExternalUrl = !vData.hasCustomApk && vData.externalApkUrl ? vData.externalApkUrl : null;
         setApkCheckInfo({
           isBinaryManifest: Boolean(vData.isBinaryManifest),
           isSignedApk: Boolean(vData.isSignedApk),
+          sha256: vData.sha256 || app.apkSha256 || null,
+          externalApkUrl: vData.externalApkUrl || app.externalApkUrl || null,
+          viaBlob: false,
         });
         verified = true;
       }
@@ -182,9 +194,13 @@ export function AppDetailView({
         setInstallError('ملف APK تالف أو غير مكتمل، يرجى من المطور إعادة رفع حزمة صالحة.');
         return;
       }
+      resolvedExternalUrl = localCheck.externalApkUrl || null;
       setApkCheckInfo({
         isBinaryManifest: localCheck.isBinaryManifest,
         isSignedApk: localCheck.isSignedApk,
+        sha256: localCheck.sha256 || app.apkSha256 || null,
+        externalApkUrl: resolvedExternalUrl,
+        viaBlob: !resolvedExternalUrl,
       });
       verified = true;
     }
@@ -216,14 +232,22 @@ export function AppDetailView({
     }
 
     let localApkBlob: Blob | null = null;
-    if (!backendOnline) {
+    if (!backendOnline && !resolvedExternalUrl) {
       localApkBlob = await localBuildOrFetchApkBlob(app);
     }
 
     setInstallProgress(100);
     setInstallPhase('handoff');
 
-    if (backendOnline) {
+    if (resolvedExternalUrl) {
+      const link = document.createElement('a');
+      link.href = resolvedExternalUrl;
+      link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
+      link.rel = 'noopener noreferrer';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } else if (backendOnline) {
       const installEndpoint = `./api/apps/${encodeURIComponent(app.id)}/install-apk`;
       const link = document.createElement('a');
       link.href = installEndpoint;
@@ -587,10 +611,19 @@ export function AppDetailView({
                   </span>
                 </div>
                 {apkCheckInfo && (
-                  <p className="text-xs text-[#01875F] font-medium mt-0.5">
-                    تم التحقق من سلامة الحزمة بنجاح
-                    {apkCheckInfo.isSignedApk ? ' · حزمة موقّعة رقمياً' : ''}
-                  </p>
+                  <div className="space-y-0.5 mt-1">
+                    <p className="text-xs text-[#01875F] font-medium">
+                      تم التحقق من سلامة بنية APK بنجاح
+                      {apkCheckInfo.isSignedApk
+                        ? ' · حزمة موقّعة رقمياً'
+                        : ' · تنبيه: لم يُرصد توقيع رقمي داخل الحزمة'}
+                    </p>
+                    {apkCheckInfo.sha256 && (
+                      <p className="text-[11px] font-mono text-[#5F6368] break-all" dir="ltr">
+                        SHA-256: {apkCheckInfo.sha256}
+                      </p>
+                    )}
+                  </div>
                 )}
               </div>
             </div>
@@ -610,15 +643,20 @@ export function AppDetailView({
               </p>
               <ol className="list-decimal list-inside space-y-1 text-[#5F6368]">
                 <li>
-                  عند اكتمال تنزيل ملف <span dir="ltr" className="font-mono">.apk</span>، اضغط على <strong>«فتح»</strong> لتشغيل واجهة مُثبّت حزم Android الرسمية.
+                  عند ظهور رسالة متصفح Chrome المعتادة («قد يكون هذا الملف ضارًا»)، فهذا تنبيه أمني عام يظهر تلقائياً لجميع ملفات <span dir="ltr" className="font-mono">.apk</span> المنزّلة من خارج Google Play عندما تكون الحزمة جديدة في قاعدة سمعة Safe Browsing؛ اختر <strong>«التنزيل على أي حال»</strong> للمتابعة إذا كنت تثق بالمطور.
+                </li>
+                <li>
+                  عند اكتمال التنزيل، اضغط على <strong>«فتح»</strong> لتشغيل واجهة مُثبّت حزم Android الرسمية.
                 </li>
                 <li>
                   إذا طلب النظام إذن التثبيت من مصادر خارجية، اختر <strong>«الإعدادات»</strong> ← فعّل <strong>«السماح من هذا المصدر»</strong> للمتصفح، ثم ارجع واضغط <strong>«تثبيت»</strong>.
                 </li>
-                <li>
-                  لا يكتمل التثبيت على جهازك إلا بعد موافقتك المباشرة داخل شاشة تأكيد Android الرسمية.
-                </li>
               </ol>
+              {apkCheckInfo?.viaBlob && (
+                <p className="text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg p-2">
+                  ملاحظة الاستضافة: يتم التنزيل حالياً من ذاكرة المتصفح المحلية على الاستضافة الثابتة؛ للحصول على رابط HTTPS مباشر عابر للأجهزة وتقليل تحذيرات التنزيل، يُنصح برفع التطبيق عبر خادم Play55 الكامل أو إضافة رابط توزيع HTTPS موثوق.
+                </p>
+              )}
             </div>
           </div>
 
@@ -742,6 +780,20 @@ export function AppDetailView({
                 {app.permissionsCount > 0 ? `${app.permissionsCount} أذونات` : 'قياسية'}
               </dd>
             </div>
+            <div className="flex items-center justify-between gap-4 py-1.5 border-b border-[#E8EAED]">
+              <dt className="text-[#5F6368]">حالة التوقيع</dt>
+              <dd className={app.isSignedApk ? 'text-[#01875F] font-semibold text-xs' : 'text-[#5F6368] text-xs'}>
+                {app.isSignedApk ? 'موقّعة رقمياً' : 'قياسية'}
+              </dd>
+            </div>
+            {app.apkSha256 && (
+              <div className="py-1.5 border-b border-[#E8EAED] space-y-1">
+                <dt className="text-[#5F6368]">بصمة التحقق (SHA-256)</dt>
+                <dd className="font-mono text-[11px] text-[#202124] break-all" dir="ltr">
+                  {app.apkSha256}
+                </dd>
+              </div>
+            )}
             <div className="flex items-center justify-between gap-4 py-1.5">
               <dt className="text-[#5F6368]">آخر تحديث</dt>
               <dd className="text-[#202124]">{formatArabicDate(app.updatedAt)}</dd>

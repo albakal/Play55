@@ -264,12 +264,29 @@ interface ApkInspectionResult {
   valid: boolean;
   isBinaryManifest: boolean;
   isSignedApk: boolean;
+  sha256: string;
   error?: string;
 }
 
+function sanitizeHttpsApkUrl(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 500) return undefined;
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'https:' || parsed.username || parsed.password) {
+      return undefined;
+    }
+    return parsed.toString();
+  } catch {
+    return undefined;
+  }
+}
+
 async function inspectApkBuffer(buffer: Buffer): Promise<ApkInspectionResult> {
+  const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
   if (buffer.byteLength < 22) {
-    return { valid: false, isBinaryManifest: false, isSignedApk: false, error: 'ملف APK تالف أو فارغ' };
+    return { valid: false, isBinaryManifest: false, isSignedApk: false, sha256, error: 'ملف APK تالف أو فارغ' };
   }
   const hasZipMagic =
     buffer[0] === 0x50 &&
@@ -280,6 +297,7 @@ async function inspectApkBuffer(buffer: Buffer): Promise<ApkInspectionResult> {
       valid: false,
       isBinaryManifest: false,
       isSignedApk: false,
+      sha256,
       error: 'الملف المرفوع ليس حزمة APK صالحة بصيغة أندرويد',
     };
   }
@@ -291,6 +309,7 @@ async function inspectApkBuffer(buffer: Buffer): Promise<ApkInspectionResult> {
         valid: false,
         isBinaryManifest: false,
         isSignedApk: false,
+        sha256,
         error: 'حزمة APK غير مكتملة (ملف AndroidManifest.xml مفقود)',
       };
     }
@@ -303,12 +322,14 @@ async function inspectApkBuffer(buffer: Buffer): Promise<ApkInspectionResult> {
       valid: true,
       isBinaryManifest,
       isSignedApk: hasCert || hasV2Sig,
+      sha256,
     };
   } catch {
     return {
       valid: false,
       isBinaryManifest: false,
       isSignedApk: false,
+      sha256,
       error: 'تعذر فك ضغط ملف APK؛ تأكد من عدم تلف الملف',
     };
   }
@@ -1112,6 +1133,8 @@ async function startServer() {
           hasCustomApk: true,
           isBinaryManifest: inspection.isBinaryManifest,
           isSignedApk: inspection.isSignedApk,
+          apkSha256: inspection.sha256,
+          externalApkUrl: sanitizeHttpsApkUrl(body.externalApkUrl),
           permissionsCount: Number(body.permissionsCount) || 0,
           downloads: 1,
           averageRating: 0,
@@ -1192,6 +1215,7 @@ async function startServer() {
         let nextSizeMB = target.sizeMB;
         let nextBinaryManifest = target.isBinaryManifest;
         let nextSignedApk = target.isSignedApk;
+        let nextSha256 = target.apkSha256;
         let nextPermissionsCount = target.permissionsCount;
 
         if (apkFile) {
@@ -1207,6 +1231,7 @@ async function startServer() {
           nextSizeMB = Number(body.sizeMB) || Number((apkFile.size / (1024 * 1024)).toFixed(2)) || target.sizeMB;
           nextBinaryManifest = inspection.isBinaryManifest;
           nextSignedApk = inspection.isSignedApk;
+          nextSha256 = inspection.sha256;
           nextPermissionsCount = Number(body.permissionsCount) || target.permissionsCount;
 
           if (oldFilename && oldFilename !== nextApkFilename) {
@@ -1230,6 +1255,13 @@ async function startServer() {
             ? screenshotFiles.map((f) => `/uploads/screenshots/${f.filename}`)
             : target.screenshots;
 
+        const nextExternalUrl =
+          typeof body.externalApkUrl === 'string'
+            ? body.externalApkUrl.trim() === ''
+              ? undefined
+              : sanitizeHttpsApkUrl(body.externalApkUrl) ?? target.externalApkUrl
+            : target.externalApkUrl;
+
         target.name = name;
         target.developer = developer;
         target.category = category;
@@ -1248,6 +1280,8 @@ async function startServer() {
         target.hasCustomApk = target.hasCustomApk || Boolean(apkFile);
         target.isBinaryManifest = nextBinaryManifest;
         target.isSignedApk = nextSignedApk;
+        target.apkSha256 = nextSha256;
+        target.externalApkUrl = nextExternalUrl;
         target.permissionsCount = nextPermissionsCount;
         target.updatedAt = new Date().toISOString();
 
@@ -1289,6 +1323,8 @@ async function startServer() {
           valid: inspection.valid,
           isBinaryManifest: inspection.isBinaryManifest,
           isSignedApk: inspection.isSignedApk,
+          sha256: inspection.sha256,
+          externalApkUrl: found.externalApkUrl || null,
           sizeBytes: buf.byteLength,
           packageName: found.packageName,
           versionName: found.versionName,
@@ -1301,6 +1337,8 @@ async function startServer() {
       valid: true,
       isBinaryManifest: Boolean(found.isBinaryManifest),
       isSignedApk: Boolean(found.isSignedApk),
+      sha256: found.apkSha256 || null,
+      externalApkUrl: found.externalApkUrl || null,
       sizeBytes: Math.round(found.sizeMB * 1024 * 1024),
       packageName: found.packageName,
       versionName: found.versionName,
@@ -1308,7 +1346,7 @@ async function startServer() {
     });
   });
 
-  // Direct APK package stream for Android Package Installer invocation
+  // Direct APK package stream with HTTP Byte-Range support for Android Download Manager
   app.get('/api/apps/:id/install-apk', async (req, res) => {
     const found = db.apps.find((a) => a.id === req.params.id);
     if (!found) {
@@ -1319,15 +1357,33 @@ async function startServer() {
     const downloadFilename = `${safeSlug(found.packageName)}-v${safeSlug(found.versionName)}.apk`;
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
     res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
+    res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    if (found.apkSha256) {
+      res.setHeader('ETag', `"${found.apkSha256}"`);
+    }
 
     if (found.hasCustomApk && found.apkFilename) {
       const resolvedApk = path.resolve(APKS_DIR, path.basename(found.apkFilename));
       const baseResolved = path.resolve(APKS_DIR) + path.sep;
       if (resolvedApk.startsWith(baseResolved) && fs.existsSync(resolvedApk)) {
         const stat = await fs.promises.stat(resolvedApk);
-        res.setHeader('Content-Length', String(stat.size));
+        const totalSize = stat.size;
+        const rangeHeader = req.headers.range;
+        if (rangeHeader && /^bytes=\d*-\d*$/.test(rangeHeader)) {
+          const [startStr, endStr] = rangeHeader.replace('bytes=', '').split('-');
+          const start = startStr ? Number(startStr) : 0;
+          const end = endStr ? Math.min(Number(endStr), totalSize - 1) : totalSize - 1;
+          if (start >= 0 && start <= end && end < totalSize) {
+            res.status(206);
+            res.setHeader('Content-Range', `bytes ${start}-${end}/${totalSize}`);
+            res.setHeader('Content-Length', String(end - start + 1));
+            fs.createReadStream(resolvedApk, { start, end }).pipe(res);
+            return;
+          }
+        }
+        res.setHeader('Content-Length', String(totalSize));
         fs.createReadStream(resolvedApk).pipe(res);
         return;
       }

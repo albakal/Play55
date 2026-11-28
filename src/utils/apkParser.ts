@@ -248,6 +248,36 @@ function arrayBufferToBase64(buffer: Uint8Array): string {
   return btoa(binary);
 }
 
+function hasAsciiBytes(haystack: Uint8Array, needle: string): boolean {
+  const nLen = needle.length;
+  if (nLen === 0 || haystack.length < nLen) return false;
+  const target = new Uint8Array(nLen);
+  for (let i = 0; i < nLen; i++) {
+    target[i] = needle.charCodeAt(i);
+  }
+  const first = target[0];
+  outer: for (let i = 0; i <= haystack.length - nLen; i++) {
+    if (haystack[i] !== first) continue;
+    for (let j = 1; j < nLen; j++) {
+      if (haystack[i + j] !== target[j]) continue outer;
+    }
+    return true;
+  }
+  return false;
+}
+
+async function computeSha256Hex(buffer: ArrayBuffer): Promise<string | undefined> {
+  try {
+    if (typeof globalThis.crypto?.subtle?.digest !== 'function') return undefined;
+    const digest = await globalThis.crypto.subtle.digest('SHA-256', buffer);
+    return Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+  } catch {
+    return undefined;
+  }
+}
+
 export async function parseApkFile(file: File): Promise<ExtractedApkInfo> {
   const sizeMB = Number((file.size / (1024 * 1024)).toFixed(2));
   const fallbackName = file.name.replace(/\.apk$/i, '').replace(/[-_]+/g, ' ').trim();
@@ -301,8 +331,9 @@ export async function parseApkFile(file: File): Promise<ExtractedApkInfo> {
     const hasMetaInfCert = fileNames.some((n) =>
       /^META-INF\/.+\.(RSA|DSA|EC|SF)$/i.test(n)
     );
-    const hasV2SigBlock = decodeUtf8(new Uint8Array(arrayBuffer)).includes('APK Sig Block 42');
+    const hasV2SigBlock = hasAsciiBytes(new Uint8Array(arrayBuffer), 'APK Sig Block 42');
     defaults.isSignedApk = hasMetaInfCert || hasV2SigBlock;
+    defaults.apkSha256 = await computeSha256Hex(arrayBuffer);
 
     const parsed = parseBinaryAndroidManifest(manifestBuffer);
     if (parsed.packageName) defaults.packageName = parsed.packageName;
