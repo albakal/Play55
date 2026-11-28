@@ -260,6 +260,9 @@ export async function parseApkFile(file: File): Promise<ExtractedApkInfo> {
     minAndroid: 'Android 8.0+',
     permissionsCount: 0,
     sizeMB: Math.max(sizeMB, 0.01),
+    isValidZipApk: false,
+    isBinaryManifest: false,
+    isSignedApk: false,
     iconDataUrl: null,
     iconBlob: null,
     iconFilename: null,
@@ -268,19 +271,46 @@ export async function parseApkFile(file: File): Promise<ExtractedApkInfo> {
 
   try {
     const arrayBuffer = await file.arrayBuffer();
+    const header = new Uint8Array(arrayBuffer.slice(0, 4));
+    const hasZipMagic =
+      header.length === 4 &&
+      header[0] === 0x50 &&
+      header[1] === 0x4b &&
+      (header[2] === 0x03 || header[2] === 0x05 || header[2] === 0x07);
+    if (!hasZipMagic) {
+      defaults.validationError = 'الملف المحدد ليس حزمة APK صالحة (ترويسة ZIP غير مطابقة).';
+      return defaults;
+    }
+
     const zip = await JSZip.loadAsync(arrayBuffer);
 
     const manifestEntry = zip.file('AndroidManifest.xml');
-    if (manifestEntry) {
-      const manifestBuffer = await manifestEntry.async('arraybuffer');
-      const parsed = parseBinaryAndroidManifest(manifestBuffer);
-      if (parsed.packageName) defaults.packageName = parsed.packageName;
-      if (parsed.versionName) defaults.versionName = parsed.versionName;
-      if (parsed.versionCode) defaults.versionCode = parsed.versionCode;
-      if (parsed.appLabel) defaults.appLabel = parsed.appLabel;
-      if (parsed.minAndroid) defaults.minAndroid = parsed.minAndroid;
-      defaults.permissionsCount = parsed.permissionsCount;
+    if (!manifestEntry) {
+      defaults.validationError = 'الملف مضغوط لكنه لا يحتوي على ملف AndroidManifest.xml.';
+      return defaults;
     }
+
+    defaults.isValidZipApk = true;
+    const manifestBuffer = await manifestEntry.async('arraybuffer');
+    if (manifestBuffer.byteLength >= 4) {
+      const mView = new DataView(manifestBuffer);
+      defaults.isBinaryManifest = mView.getUint16(0, true) === 0x0003;
+    }
+
+    const fileNames = Object.keys(zip.files);
+    const hasMetaInfCert = fileNames.some((n) =>
+      /^META-INF\/.+\.(RSA|DSA|EC|SF)$/i.test(n)
+    );
+    const hasV2SigBlock = decodeUtf8(new Uint8Array(arrayBuffer)).includes('APK Sig Block 42');
+    defaults.isSignedApk = hasMetaInfCert || hasV2SigBlock;
+
+    const parsed = parseBinaryAndroidManifest(manifestBuffer);
+    if (parsed.packageName) defaults.packageName = parsed.packageName;
+    if (parsed.versionName) defaults.versionName = parsed.versionName;
+    if (parsed.versionCode) defaults.versionCode = parsed.versionCode;
+    if (parsed.appLabel) defaults.appLabel = parsed.appLabel;
+    if (parsed.minAndroid) defaults.minAndroid = parsed.minAndroid;
+    defaults.permissionsCount = parsed.permissionsCount;
 
     // Find best icon inside the APK archive
     let bestPath: string | null = null;
@@ -318,7 +348,7 @@ export async function parseApkFile(file: File): Promise<ExtractedApkInfo> {
       defaults.iconSourcePath = bestPath;
     }
   } catch {
-    // If file is not a valid zip/APK, still return clean fallback metadata
+    defaults.validationError = 'تعذر فحص حزمة APK؛ قد يكون الملف تالفاً أو غير مكتمل.';
   }
 
   return defaults;

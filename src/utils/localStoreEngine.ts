@@ -9,7 +9,9 @@ import type {
 import { FALLBACK_APPS, FALLBACK_REVIEWS } from '../catalog/fallbackStore.ts';
 
 const DB_NAME = 'app_store_plus_db';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
+const ACTIVE_SESSION_KEY = 'current';
+const SESSION_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
 
 interface LocalStoredUser {
   uid: string;
@@ -18,6 +20,13 @@ interface LocalStoredUser {
   saltHex: string;
   hashHex: string;
   createdAt: string;
+}
+
+interface LocalSessionRecord {
+  id: string;
+  token: string;
+  user: DeveloperSessionUser;
+  expiresAt: number;
 }
 
 interface AppStatsPatch {
@@ -37,6 +46,7 @@ const memoryStores: Record<string, Map<string, unknown>> = {
   reviews: new Map(),
   appStats: new Map(),
   reviewHelpful: new Map(),
+  activeSession: new Map(),
 };
 
 const STORE_KEYS: Record<string, string> = {
@@ -46,6 +56,7 @@ const STORE_KEYS: Record<string, string> = {
   reviews: 'id',
   appStats: 'appId',
   reviewHelpful: 'reviewId',
+  activeSession: 'id',
 };
 
 async function openLocalDb(): Promise<IDBDatabase | null> {
@@ -72,6 +83,9 @@ async function openLocalDb(): Promise<IDBDatabase | null> {
         }
         if (!db.objectStoreNames.contains('reviewHelpful')) {
           db.createObjectStore('reviewHelpful', { keyPath: 'reviewId' });
+        }
+        if (!db.objectStoreNames.contains('activeSession')) {
+          db.createObjectStore('activeSession', { keyPath: 'id' });
         }
       };
       req.onsuccess = () => resolve(req.result);
@@ -408,6 +422,47 @@ export async function localGetAppDetail(appId: string): Promise<AppDetailRespons
   };
 }
 
+export async function localSaveSession(
+  user: DeveloperSessionUser,
+  token: string
+): Promise<void> {
+  const db = await openLocalDb();
+  const record: LocalSessionRecord = {
+    id: ACTIVE_SESSION_KEY,
+    token,
+    user,
+    expiresAt: Date.now() + SESSION_DURATION_MS,
+  };
+  await idbPut(db, 'activeSession', record);
+}
+
+export async function localGetSession(): Promise<{
+  user: DeveloperSessionUser;
+  token: string;
+} | null> {
+  try {
+    const db = await openLocalDb();
+    const record = await idbGet<LocalSessionRecord>(db, 'activeSession', ACTIVE_SESSION_KEY);
+    if (!record || !record.user || !record.token) return null;
+    if (typeof record.expiresAt === 'number' && record.expiresAt < Date.now()) {
+      await idbDelete(db, 'activeSession', ACTIVE_SESSION_KEY);
+      return null;
+    }
+    return { user: record.user, token: record.token };
+  } catch {
+    return null;
+  }
+}
+
+export async function localClearSession(): Promise<void> {
+  try {
+    const db = await openLocalDb();
+    await idbDelete(db, 'activeSession', ACTIVE_SESSION_KEY);
+  } catch {
+    // Ignore storage clear errors
+  }
+}
+
 export async function localPublishApp(params: {
   apkFile: File;
   iconSource: Blob | null;
@@ -424,6 +479,8 @@ export async function localPublishApp(params: {
   minAndroid: string;
   ageRating: string;
   sizeMB: number;
+  isBinaryManifest?: boolean;
+  isSignedApk?: boolean;
   permissionsCount: number;
   owner: DeveloperSessionUser;
 }): Promise<StoreApp> {
@@ -448,7 +505,7 @@ export async function localPublishApp(params: {
     category: params.category,
     shortDescription: params.shortDescription.trim(),
     fullDescription: params.fullDescription.trim() || params.shortDescription.trim(),
-    whatsNew: params.whatsNew.trim() || 'الإصدار الأولي على متجر تطبيقات بلس.',
+    whatsNew: params.whatsNew.trim() || 'الإصدار الأولي على منصة Play55.',
     packageName: params.packageName.trim() || 'com.app.android',
     versionName: params.versionName.trim() || '1.0.0',
     versionCode: params.versionCode.trim() || '1',
@@ -459,6 +516,8 @@ export async function localPublishApp(params: {
     screenshots: screenshotUrls,
     apkFilename: params.apkFile.name,
     hasCustomApk: true,
+    isBinaryManifest: params.isBinaryManifest,
+    isSignedApk: params.isSignedApk,
     permissionsCount: params.permissionsCount,
     downloads: 1,
     averageRating: 0,
@@ -474,6 +533,115 @@ export async function localPublishApp(params: {
   await idbPut(db, 'apkBlobs', { appId, blob: params.apkFile });
   await idbPut(db, 'apps', newApp);
   return newApp;
+}
+
+export async function localUpdateApp(params: {
+  existingApp: StoreApp;
+  apkFile: File | null;
+  iconSource: Blob | null;
+  screenshots: File[];
+  name: string;
+  developer: string;
+  category: AppCategory;
+  shortDescription: string;
+  fullDescription: string;
+  whatsNew: string;
+  packageName: string;
+  versionName: string;
+  versionCode: string;
+  minAndroid: string;
+  ageRating: string;
+  sizeMB?: number;
+  isBinaryManifest?: boolean;
+  isSignedApk?: boolean;
+  permissionsCount?: number;
+  owner: DeveloperSessionUser;
+}): Promise<StoreApp> {
+  if (params.existingApp.ownerUid && params.existingApp.ownerUid !== params.owner.uid) {
+    throw new Error('لا تملك صلاحية تحديث هذا التطبيق');
+  }
+  const db = await openLocalDb();
+
+  let iconUrl = params.existingApp.iconUrl;
+  if (params.iconSource) {
+    iconUrl = await blobToDataUrl(params.iconSource);
+  }
+
+  let screenshotUrls = params.existingApp.screenshots;
+  if (params.screenshots.length > 0) {
+    screenshotUrls = [];
+    for (const file of params.screenshots.slice(0, 8)) {
+      screenshotUrls.push(await blobToDataUrl(file));
+    }
+  }
+
+  if (params.apkFile) {
+    await idbPut(db, 'apkBlobs', { appId: params.existingApp.id, blob: params.apkFile });
+  }
+
+  const updatedApp: StoreApp = {
+    ...params.existingApp,
+    name: params.name.trim() || params.existingApp.name,
+    developer: params.developer.trim() || params.existingApp.developer,
+    category: params.category,
+    shortDescription: params.shortDescription.trim() || params.existingApp.shortDescription,
+    fullDescription: params.fullDescription.trim() || params.existingApp.fullDescription,
+    whatsNew: params.whatsNew.trim() || params.existingApp.whatsNew,
+    packageName: params.packageName.trim() || params.existingApp.packageName,
+    versionName: params.versionName.trim() || params.existingApp.versionName,
+    versionCode: params.versionCode.trim() || params.existingApp.versionCode,
+    minAndroid: params.minAndroid.trim() || params.existingApp.minAndroid,
+    ageRating: params.ageRating.trim() || params.existingApp.ageRating,
+    sizeMB: Math.max(params.sizeMB ?? params.existingApp.sizeMB, 0.01),
+    iconUrl,
+    screenshots: screenshotUrls,
+    apkFilename: params.apkFile ? params.apkFile.name : params.existingApp.apkFilename,
+    hasCustomApk: params.existingApp.hasCustomApk || Boolean(params.apkFile),
+    isBinaryManifest: params.isBinaryManifest ?? params.existingApp.isBinaryManifest,
+    isSignedApk: params.isSignedApk ?? params.existingApp.isSignedApk,
+    permissionsCount: params.permissionsCount ?? params.existingApp.permissionsCount,
+    updatedAt: new Date().toISOString(),
+  };
+
+  await idbPut(db, 'apps', updatedApp);
+  return updatedApp;
+}
+
+export async function localVerifyApkBlob(app: StoreApp): Promise<{
+  valid: boolean;
+  isBinaryManifest: boolean;
+  isSignedApk: boolean;
+  hasCustomApk: boolean;
+}> {
+  const blob = await localBuildOrFetchApkBlob(app);
+  try {
+    const buf = await blob.arrayBuffer();
+    const header = new Uint8Array(buf.slice(0, 4));
+    const hasZipMagic =
+      header.length === 4 &&
+      header[0] === 0x50 &&
+      header[1] === 0x4b &&
+      (header[2] === 0x03 || header[2] === 0x05 || header[2] === 0x07);
+    if (!hasZipMagic) {
+      return { valid: false, isBinaryManifest: false, isSignedApk: false, hasCustomApk: app.hasCustomApk };
+    }
+    const zip = await JSZip.loadAsync(buf);
+    const manifest = zip.file('AndroidManifest.xml');
+    if (!manifest) {
+      return { valid: false, isBinaryManifest: false, isSignedApk: false, hasCustomApk: app.hasCustomApk };
+    }
+    const mBuf = await manifest.async('arraybuffer');
+    const isBinaryManifest = mBuf.byteLength >= 4 && new DataView(mBuf).getUint16(0, true) === 0x0003;
+    const hasCert = Object.keys(zip.files).some((n) => /^META-INF\/.+\.(RSA|DSA|EC|SF)$/i.test(n));
+    return {
+      valid: true,
+      isBinaryManifest,
+      isSignedApk: hasCert || Boolean(app.isSignedApk),
+      hasCustomApk: app.hasCustomApk,
+    };
+  } catch {
+    return { valid: false, isBinaryManifest: false, isSignedApk: false, hasCustomApk: app.hasCustomApk };
+  }
 }
 
 export async function localIncrementInstall(app: StoreApp): Promise<number> {

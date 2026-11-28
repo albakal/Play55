@@ -93,6 +93,9 @@ function verifyPassword(password: string, salt: string, expectedHash: string): b
   return crypto.timingSafeEqual(derived, expected);
 }
 
+const SESSION_COOKIE_NAME = 'play55_session';
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
 interface CustomTokenPayload {
   uid: string;
   email: string;
@@ -105,7 +108,7 @@ function signSessionToken(user: StoredUser): string {
     uid: user.uid,
     email: user.email,
     name: user.displayName,
-    exp: Date.now() + 7 * 24 * 60 * 60 * 1000,
+    exp: Date.now() + SESSION_TTL_MS,
   };
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
   const sig = crypto.createHmac('sha256', SESSION_SECRET).update(encoded).digest('base64url');
@@ -142,6 +145,79 @@ function verifySessionToken(token: string): VerifiedDeveloper | null {
   }
 }
 
+function parseCookies(req: express.Request): Record<string, string> {
+  const raw = req.headers.cookie || '';
+  const out: Record<string, string> = {};
+  for (const part of raw.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const key = part.slice(0, idx).trim();
+    const val = part.slice(idx + 1).trim();
+    try {
+      out[key] = decodeURIComponent(val);
+    } catch {
+      out[key] = val;
+    }
+  }
+  return out;
+}
+
+function isHttpsRequest(req: express.Request): boolean {
+  const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+  return req.secure || forwardedProto === 'https';
+}
+
+function setSessionCookie(res: express.Response, req: express.Request, token: string): void {
+  const maxAgeSec = Math.floor(SESSION_TTL_MS / 1000);
+  const parts = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(token)}`,
+    'Path=/',
+    `Max-Age=${maxAgeSec}`,
+    'HttpOnly',
+  ];
+  if (isHttpsRequest(req)) {
+    parts.push('Secure', 'SameSite=None', 'Partitioned');
+  } else {
+    parts.push('SameSite=Lax');
+  }
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function clearSessionCookie(res: express.Response, req: express.Request): void {
+  const parts = [
+    `${SESSION_COOKIE_NAME}=`,
+    'Path=/',
+    'Max-Age=0',
+    'HttpOnly',
+  ];
+  if (isHttpsRequest(req)) {
+    parts.push('Secure', 'SameSite=None', 'Partitioned');
+  } else {
+    parts.push('SameSite=Lax');
+  }
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function hasSafeCookieMutationOrigin(req: express.Request): boolean {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') {
+    return true;
+  }
+  const customHeader = String(req.headers['x-requested-with'] || '');
+  if (customHeader === 'Play55' || customHeader === 'XMLHttpRequest') {
+    return true;
+  }
+  const origin = req.headers.origin;
+  const host = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim();
+  if (origin && host) {
+    try {
+      return new URL(origin).host === host;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 interface VerifiedDeveloper {
   uid: string;
   email: string;
@@ -151,25 +227,90 @@ interface VerifiedDeveloper {
 
 async function verifyDeveloperRequest(req: express.Request): Promise<VerifiedDeveloper | null> {
   const authHeader = req.headers.authorization || '';
-  if (!authHeader.startsWith('Bearer ')) return null;
-  const token = authHeader.slice(7).trim();
-  if (!token) return null;
-
-  if (token.startsWith('dev1.')) {
-    return verifySessionToken(token);
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7).trim();
+    if (token) {
+      if (token.startsWith('dev1.')) {
+        return verifySessionToken(token);
+      }
+      if (adminAuth) {
+        try {
+          const decoded = await adminAuth.verifyIdToken(token);
+          return {
+            uid: decoded.uid,
+            email: decoded.email || '',
+            name: typeof decoded.name === 'string' ? decoded.name : '',
+            provider: 'google',
+          };
+        } catch {
+          // Fall through to cookie check
+        }
+      }
+    }
   }
 
-  if (!adminAuth) return null;
-  try {
-    const decoded = await adminAuth.verifyIdToken(token);
+  const cookies = parseCookies(req);
+  const cookieToken = cookies[SESSION_COOKIE_NAME];
+  if (!cookieToken || !cookieToken.startsWith('dev1.')) {
+    return null;
+  }
+  if (!hasSafeCookieMutationOrigin(req)) {
+    return null;
+  }
+  return verifySessionToken(cookieToken);
+}
+
+interface ApkInspectionResult {
+  valid: boolean;
+  isBinaryManifest: boolean;
+  isSignedApk: boolean;
+  error?: string;
+}
+
+async function inspectApkBuffer(buffer: Buffer): Promise<ApkInspectionResult> {
+  if (buffer.byteLength < 22) {
+    return { valid: false, isBinaryManifest: false, isSignedApk: false, error: 'ملف APK تالف أو فارغ' };
+  }
+  const hasZipMagic =
+    buffer[0] === 0x50 &&
+    buffer[1] === 0x4b &&
+    (buffer[2] === 0x03 || buffer[2] === 0x05 || buffer[2] === 0x07);
+  if (!hasZipMagic) {
     return {
-      uid: decoded.uid,
-      email: decoded.email || '',
-      name: typeof decoded.name === 'string' ? decoded.name : '',
-      provider: 'google',
+      valid: false,
+      isBinaryManifest: false,
+      isSignedApk: false,
+      error: 'الملف المرفوع ليس حزمة APK صالحة بصيغة أندرويد',
+    };
+  }
+  try {
+    const zip = await JSZip.loadAsync(buffer);
+    const manifest = zip.file('AndroidManifest.xml');
+    if (!manifest) {
+      return {
+        valid: false,
+        isBinaryManifest: false,
+        isSignedApk: false,
+        error: 'حزمة APK غير مكتملة (ملف AndroidManifest.xml مفقود)',
+      };
+    }
+    const manifestBuf = await manifest.async('nodebuffer');
+    const isBinaryManifest = manifestBuf.byteLength >= 4 && manifestBuf.readUInt16LE(0) === 0x0003;
+    const fileNames = Object.keys(zip.files);
+    const hasCert = fileNames.some((n) => /^META-INF\/.+\.(RSA|DSA|EC|SF)$/i.test(n));
+    const hasV2Sig = buffer.includes('APK Sig Block 42');
+    return {
+      valid: true,
+      isBinaryManifest,
+      isSignedApk: hasCert || hasV2Sig,
     };
   } catch {
-    return null;
+    return {
+      valid: false,
+      isBinaryManifest: false,
+      isSignedApk: false,
+      error: 'تعذر فك ضغط ملف APK؛ تأكد من عدم تلف الملف',
+    };
   }
 }
 
@@ -710,6 +851,7 @@ async function startServer() {
     await saveUsers(usersDb);
 
     const token = signSessionToken(newUser);
+    setSessionCookie(res, req, token);
     res.status(201).json({
       token,
       user: {
@@ -740,6 +882,7 @@ async function startServer() {
     }
 
     const token = signSessionToken(found);
+    setSessionCookie(res, req, token);
     res.json({
       token,
       user: {
@@ -752,18 +895,27 @@ async function startServer() {
     });
   });
 
-  // Verify current session
+  // Explicit logout clears persistent HttpOnly session cookie
+  app.post('/api/auth/logout', (req, res) => {
+    clearSessionCookie(res, req);
+    res.json({ ok: true });
+  });
+
+  // Verify and restore current persistent session
   app.get('/api/auth/me', async (req, res) => {
     const verified = await verifyDeveloperRequest(req);
     if (!verified) {
       res.status(401).json({ error: 'الجلسة غير صالحة' });
       return;
     }
+    const stored = verified.provider === 'manual'
+      ? usersDb.find((u) => u.uid === verified.uid)
+      : undefined;
     res.json({
       user: {
         uid: verified.uid,
-        displayName: verified.name || verified.email,
-        email: verified.email,
+        displayName: stored?.displayName || verified.name || verified.email,
+        email: stored?.email || verified.email,
         photoURL: null,
         provider: verified.provider,
       },
@@ -897,6 +1049,14 @@ async function startServer() {
           return;
         }
 
+        const apkBuffer = await fs.promises.readFile(apkFile.path);
+        const inspection = await inspectApkBuffer(apkBuffer);
+        if (!inspection.valid) {
+          fs.promises.unlink(apkFile.path).catch(() => {});
+          res.status(400).json({ error: inspection.error || 'ملف APK غير صالح' });
+          return;
+        }
+
         const iconFile = files?.icon?.[0];
         let iconUrl = '/api/brand-icon/nabd';
 
@@ -905,7 +1065,6 @@ async function startServer() {
         } else {
           // Server-side fallback: attempt to extract icon directly from uploaded APK
           try {
-            const apkBuffer = await fs.promises.readFile(apkFile.path);
             const zip = await JSZip.loadAsync(apkBuffer);
             const candidates = Object.values(zip.files).filter(
               (entry) =>
@@ -940,7 +1099,7 @@ async function startServer() {
           category,
           shortDescription,
           fullDescription,
-          whatsNew: (body.whatsNew || '').trim() || 'الإصدار الأولي على متجر تطبيقات بلس.',
+          whatsNew: (body.whatsNew || '').trim() || 'الإصدار الأولي على منصة Play55.',
           packageName: (body.packageName || '').trim() || `com.app.${safeSlug(name).toLowerCase()}`,
           versionName: (body.versionName || '').trim() || '1.0.0',
           versionCode: (body.versionCode || '').trim() || '1',
@@ -951,6 +1110,8 @@ async function startServer() {
           screenshots,
           apkFilename: apkFile.filename,
           hasCustomApk: true,
+          isBinaryManifest: inspection.isBinaryManifest,
+          isSignedApk: inspection.isSignedApk,
           permissionsCount: Number(body.permissionsCount) || 0,
           downloads: 1,
           averageRating: 0,
@@ -974,6 +1135,131 @@ async function startServer() {
     }
   );
 
+  // Update existing app preserving the same permanent APP_ID and link
+  app.put(
+    '/api/apps/:id',
+    async (req, res, next) => {
+      const developerUser = await verifyDeveloperRequest(req);
+      if (!developerUser) {
+        res.status(401).json({ error: 'يجب تسجيل الدخول بحساب المطور لتحديث التطبيق' });
+        return;
+      }
+      const target = db.apps.find((a) => a.id === req.params.id);
+      if (!target) {
+        res.status(404).json({ error: 'التطبيق غير موجود' });
+        return;
+      }
+      if (!target.ownerUid || target.ownerUid !== developerUser.uid) {
+        res.status(403).json({ error: 'لا تملك صلاحية تحديث هذا التطبيق' });
+        return;
+      }
+      res.locals.developerUser = developerUser;
+      res.locals.targetApp = target;
+      next();
+    },
+    upload.fields([
+      { name: 'apk', maxCount: 1 },
+      { name: 'icon', maxCount: 1 },
+      { name: 'screenshots', maxCount: 8 },
+    ]),
+    async (req, res) => {
+      try {
+        const target = res.locals.targetApp as StoreApp;
+        const files = req.files as Record<string, Express.Multer.File[]> | undefined;
+        const apkFile = files?.apk?.[0];
+        const body = req.body as Record<string, string>;
+
+        const ALLOWED_CATEGORIES: AppCategory[] = [
+          'الإنتاجية',
+          'الأدوات',
+          'الصوتيات',
+          'التعليم',
+          'الأعمال',
+          'التصوير',
+          'الألعاب',
+        ];
+
+        const name = (body.name || '').trim() || target.name;
+        const developer = (body.developer || '').trim() || target.developer;
+        const rawCategory = (body.category || '').trim() as AppCategory;
+        const category: AppCategory = ALLOWED_CATEGORIES.includes(rawCategory)
+          ? rawCategory
+          : target.category;
+        const shortDescription = (body.shortDescription || '').trim() || target.shortDescription;
+        const fullDescription = (body.fullDescription || '').trim() || target.fullDescription;
+
+        let nextApkFilename = target.apkFilename;
+        let nextSizeMB = target.sizeMB;
+        let nextBinaryManifest = target.isBinaryManifest;
+        let nextSignedApk = target.isSignedApk;
+        let nextPermissionsCount = target.permissionsCount;
+
+        if (apkFile) {
+          const apkBuffer = await fs.promises.readFile(apkFile.path);
+          const inspection = await inspectApkBuffer(apkBuffer);
+          if (!inspection.valid) {
+            fs.promises.unlink(apkFile.path).catch(() => {});
+            res.status(400).json({ error: inspection.error || 'ملف APK المحدث غير صالح' });
+            return;
+          }
+          const oldFilename = target.apkFilename;
+          nextApkFilename = apkFile.filename;
+          nextSizeMB = Number(body.sizeMB) || Number((apkFile.size / (1024 * 1024)).toFixed(2)) || target.sizeMB;
+          nextBinaryManifest = inspection.isBinaryManifest;
+          nextSignedApk = inspection.isSignedApk;
+          nextPermissionsCount = Number(body.permissionsCount) || target.permissionsCount;
+
+          if (oldFilename && oldFilename !== nextApkFilename) {
+            const oldResolved = path.resolve(APKS_DIR, path.basename(oldFilename));
+            const baseResolved = path.resolve(APKS_DIR) + path.sep;
+            if (oldResolved.startsWith(baseResolved) && fs.existsSync(oldResolved)) {
+              fs.promises.unlink(oldResolved).catch(() => {});
+            }
+          }
+        }
+
+        const iconFile = files?.icon?.[0];
+        let nextIconUrl = target.iconUrl;
+        if (iconFile) {
+          nextIconUrl = `/uploads/icons/${iconFile.filename}`;
+        }
+
+        const screenshotFiles = files?.screenshots || [];
+        const nextScreenshots =
+          screenshotFiles.length > 0
+            ? screenshotFiles.map((f) => `/uploads/screenshots/${f.filename}`)
+            : target.screenshots;
+
+        target.name = name;
+        target.developer = developer;
+        target.category = category;
+        target.shortDescription = shortDescription;
+        target.fullDescription = fullDescription;
+        target.whatsNew = (body.whatsNew || '').trim() || target.whatsNew;
+        target.packageName = (body.packageName || '').trim() || target.packageName;
+        target.versionName = (body.versionName || '').trim() || target.versionName;
+        target.versionCode = (body.versionCode || '').trim() || target.versionCode;
+        target.minAndroid = (body.minAndroid || '').trim() || target.minAndroid;
+        target.ageRating = (body.ageRating || '').trim() || target.ageRating;
+        target.sizeMB = Math.max(nextSizeMB, 0.01);
+        target.iconUrl = nextIconUrl;
+        target.screenshots = nextScreenshots;
+        target.apkFilename = nextApkFilename;
+        target.hasCustomApk = target.hasCustomApk || Boolean(apkFile);
+        target.isBinaryManifest = nextBinaryManifest;
+        target.isSignedApk = nextSignedApk;
+        target.permissionsCount = nextPermissionsCount;
+        target.updatedAt = new Date().toISOString();
+
+        await saveStore(db);
+        res.json({ app: target });
+      } catch (err) {
+        console.error('Update error:', err);
+        res.status(500).json({ error: 'حدث خطأ أثناء تحديث بيانات التطبيق أو حزمة APK' });
+      }
+    }
+  );
+
   // Increment install counter
   app.post('/api/apps/:id/install', async (req, res) => {
     const found = db.apps.find((a) => a.id === req.params.id);
@@ -986,7 +1272,43 @@ async function startServer() {
     res.json({ downloads: found.downloads });
   });
 
-  // Direct APK package stream for instant Android Package Installer invocation
+  // Pre-install integrity verification endpoint
+  app.get('/api/apps/:id/verify-apk', async (req, res) => {
+    const found = db.apps.find((a) => a.id === req.params.id);
+    if (!found) {
+      res.status(404).json({ error: 'التطبيق غير موجود' });
+      return;
+    }
+    if (found.hasCustomApk && found.apkFilename) {
+      const resolvedApk = path.resolve(APKS_DIR, path.basename(found.apkFilename));
+      const baseResolved = path.resolve(APKS_DIR) + path.sep;
+      if (resolvedApk.startsWith(baseResolved) && fs.existsSync(resolvedApk)) {
+        const buf = await fs.promises.readFile(resolvedApk);
+        const inspection = await inspectApkBuffer(buf);
+        res.json({
+          valid: inspection.valid,
+          isBinaryManifest: inspection.isBinaryManifest,
+          isSignedApk: inspection.isSignedApk,
+          sizeBytes: buf.byteLength,
+          packageName: found.packageName,
+          versionName: found.versionName,
+          hasCustomApk: true,
+        });
+        return;
+      }
+    }
+    res.json({
+      valid: true,
+      isBinaryManifest: Boolean(found.isBinaryManifest),
+      isSignedApk: Boolean(found.isSignedApk),
+      sizeBytes: Math.round(found.sizeMB * 1024 * 1024),
+      packageName: found.packageName,
+      versionName: found.versionName,
+      hasCustomApk: false,
+    });
+  });
+
+  // Direct APK package stream for Android Package Installer invocation
   app.get('/api/apps/:id/install-apk', async (req, res) => {
     const found = db.apps.find((a) => a.id === req.params.id);
     if (!found) {
@@ -996,16 +1318,17 @@ async function startServer() {
 
     const downloadFilename = `${safeSlug(found.packageName)}-v${safeSlug(found.versionName)}.apk`;
     res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-    res.setHeader('Content-Disposition', `inline; filename="${downloadFilename}"`);
+    res.setHeader('Content-Disposition', `attachment; filename="${downloadFilename}"`);
     res.setHeader('X-Content-Type-Options', 'nosniff');
     res.setHeader('Cache-Control', 'no-store');
 
     if (found.hasCustomApk && found.apkFilename) {
-      const apkPath = path.join(APKS_DIR, path.basename(found.apkFilename));
-      if (fs.existsSync(apkPath)) {
-        const stat = await fs.promises.stat(apkPath);
+      const resolvedApk = path.resolve(APKS_DIR, path.basename(found.apkFilename));
+      const baseResolved = path.resolve(APKS_DIR) + path.sep;
+      if (resolvedApk.startsWith(baseResolved) && fs.existsSync(resolvedApk)) {
+        const stat = await fs.promises.stat(resolvedApk);
         res.setHeader('Content-Length', String(stat.size));
-        fs.createReadStream(apkPath).pipe(res);
+        fs.createReadStream(resolvedApk).pipe(res);
         return;
       }
     }
@@ -1098,8 +1421,11 @@ async function startServer() {
     db.reviews = db.reviews.filter((r) => r.appId !== removed.id);
 
     if (removed.hasCustomApk && removed.apkFilename) {
-      const apkPath = path.join(APKS_DIR, path.basename(removed.apkFilename));
-      if (fs.existsSync(apkPath)) fs.promises.unlink(apkPath).catch(() => {});
+      const resolvedApk = path.resolve(APKS_DIR, path.basename(removed.apkFilename));
+      const baseResolved = path.resolve(APKS_DIR) + path.sep;
+      if (resolvedApk.startsWith(baseResolved) && fs.existsSync(resolvedApk)) {
+        fs.promises.unlink(resolvedApk).catch(() => {});
+      }
     }
     await saveStore(db);
     res.json({ deleted: true });

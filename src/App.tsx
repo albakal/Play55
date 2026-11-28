@@ -27,11 +27,15 @@ import {
 } from './catalog/fallbackStore.ts';
 import {
   localBuildOrFetchApkBlob,
+  localClearSession,
   localGetAppDetail,
+  localGetSession,
   localIncrementInstall,
   localListApps,
   localLoginDeveloper,
   localRegisterDeveloper,
+  localSaveSession,
+  localVerifyApkBlob,
 } from './utils/localStoreEngine.ts';
 import { StoreHeader } from './components/StoreHeader.tsx';
 import type { NavTab } from './components/StoreHeader.tsx';
@@ -71,9 +75,13 @@ export default function App() {
   });
   const [detailData, setDetailData] = useState<AppDetailResponse | null>(null);
   const [loadingDetail, setLoadingDetail] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
 
   const [quickInstallingId, setQuickInstallingId] = useState<string | null>(null);
   const [quickInstalledId, setQuickInstalledId] = useState<string | null>(null);
+  const [quickInstallError, setQuickInstallError] = useState<string | null>(null);
+
+  const [editingApp, setEditingApp] = useState<StoreApp | null>(null);
 
   const [currentUser, setCurrentUser] = useState<DeveloperSessionUser | null>(null);
   const [manualToken, setManualToken] = useState<string | null>(null);
@@ -81,9 +89,49 @@ export default function App() {
   const [authError, setAuthError] = useState<string | null>(null);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => setAuthLoading(false), 2500);
+    let active = true;
+    const timer = window.setTimeout(() => {
+      if (active) setAuthLoading(false);
+    }, 2500);
+
+    const restoreManualOrLocalSession = async () => {
+      try {
+        const res = await fetch('./api/auth/me', {
+          credentials: 'include',
+        });
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
+          const data = (await res.json()) as { user?: DeveloperSessionUser };
+          if (active && data.user) {
+            setCurrentUser((prev) => prev || data.user || null);
+            setAuthLoading(false);
+            return;
+          }
+        } else if (!contentType.includes('application/json') || res.status === 404 || res.status === 405) {
+          const localSess = await localGetSession();
+          if (active && localSess) {
+            setManualToken(localSess.token);
+            setCurrentUser((prev) => prev || localSess.user);
+            setAuthLoading(false);
+            return;
+          }
+        }
+      } catch {
+        const localSess = await localGetSession().catch(() => null);
+        if (active && localSess) {
+          setManualToken(localSess.token);
+          setCurrentUser((prev) => prev || localSess.user);
+        }
+      } finally {
+        if (active) setAuthLoading(false);
+      }
+    };
+
+    void restoreManualOrLocalSession();
+
     const unsubscribe = onAuthStateChanged(auth, (fbUser) => {
       window.clearTimeout(timer);
+      if (!active) return;
       if (fbUser) {
         setManualToken(null);
         setCurrentUser({
@@ -96,12 +144,13 @@ export default function App() {
         void syncDeveloperProfile(fbUser).catch(() => {
           // Handled inside syncDeveloperProfile error logging
         });
+        setAuthLoading(false);
       } else {
         setCurrentUser((prev) => (prev?.provider === 'manual' ? prev : null));
       }
-      setAuthLoading(false);
     });
     return () => {
+      active = false;
       window.clearTimeout(timer);
       unsubscribe();
     };
@@ -125,6 +174,7 @@ export default function App() {
               email: params.email,
               password: params.password,
             });
+      await localSaveSession(localResult.user, localResult.token).catch(() => {});
       setManualToken(localResult.token);
       setCurrentUser(localResult.user);
     } catch (localErr) {
@@ -148,7 +198,11 @@ export default function App() {
     try {
       const res = await fetch(endpoint, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Requested-With': 'Play55',
+        },
         body: JSON.stringify({
           name: params.name,
           email: params.email,
@@ -203,6 +257,13 @@ export default function App() {
     setAuthError(null);
     setManualToken(null);
     setCurrentUser(null);
+    setEditingApp(null);
+    await fetch('./api/auth/logout', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'X-Requested-With': 'Play55' },
+    }).catch(() => {});
+    await localClearSession().catch(() => {});
     await signOutDeveloper().catch(() => {});
   };
 
@@ -257,47 +318,100 @@ export default function App() {
     }
   }, [activeTab, fetchApps]);
 
-  const openAppDetail = useCallback(async (appId: string) => {
-    setSelectedAppId(appId);
-    setLoadingDetail(true);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+  const syncAppQueryUrl = useCallback((appId: string | null) => {
     try {
-      const res = await fetch(`./api/apps/${encodeURIComponent(appId)}`);
-      const contentType = res.headers.get('content-type') || '';
-      if (!res.ok || !contentType.includes('application/json')) {
-        const localDetail = await localGetAppDetail(appId);
-        if (localDetail) {
-          setDetailData(localDetail);
-          return;
-        }
-        setSelectedAppId(null);
-        setDetailData(null);
-        return;
-      }
-      const data = (await res.json()) as AppDetailResponse;
-      setDetailData(data);
-    } catch {
-      const localDetail = await localGetAppDetail(appId);
-      if (localDetail) {
-        setDetailData(localDetail);
+      const url = new URL(window.location.href);
+      if (appId) {
+        url.searchParams.set('app', appId);
       } else {
-        setDetailData(null);
+        url.searchParams.delete('app');
       }
-    } finally {
-      setLoadingDetail(false);
+      window.history.pushState({ appId }, '', url.toString());
+    } catch {
+      // Ignore history API issues
     }
   }, []);
 
+  const openAppDetail = useCallback(
+    async (appId: string, pushHistory = true) => {
+      setSelectedAppId(appId);
+      setDetailError(null);
+      setLoadingDetail(true);
+      if (pushHistory) {
+        const currentParam = new URLSearchParams(window.location.search).get('app');
+        if (currentParam !== appId) {
+          syncAppQueryUrl(appId);
+        }
+      }
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      try {
+        const res = await fetch(`./api/apps/${encodeURIComponent(appId)}`);
+        const contentType = res.headers.get('content-type') || '';
+        if (!contentType.includes('application/json')) {
+          const localDetail = await localGetAppDetail(appId);
+          if (localDetail) {
+            setDetailData(localDetail);
+          } else {
+            setDetailData(null);
+            setDetailError('التطبيق المطلوب غير موجود أو تم حذفه.');
+          }
+          return;
+        }
+        if (!res.ok) {
+          setDetailData(null);
+          setDetailError('التطبيق المطلوب غير موجود أو تم حذفه.');
+          return;
+        }
+        const data = (await res.json()) as AppDetailResponse;
+        setDetailData(data);
+      } catch {
+        const localDetail = await localGetAppDetail(appId);
+        if (localDetail) {
+          setDetailData(localDetail);
+        } else {
+          setDetailData(null);
+          setDetailError('التطبيق المطلوب غير موجود أو تعذر تحميل بياناته.');
+        }
+      } finally {
+        setLoadingDetail(false);
+      }
+    },
+    [syncAppQueryUrl]
+  );
+
   useEffect(() => {
-    if (selectedAppId && !detailData) {
-      void openAppDetail(selectedAppId);
+    if (selectedAppId && !detailData && !detailError) {
+      void openAppDetail(selectedAppId, false);
     }
-  }, [selectedAppId, detailData, openAppDetail]);
+  }, [selectedAppId, detailData, detailError, openAppDetail]);
+
+  useEffect(() => {
+    const onPopState = () => {
+      const appParam = new URLSearchParams(window.location.search).get('app');
+      if (appParam) {
+        setActiveTab('apps');
+        void openAppDetail(appParam, false);
+      } else {
+        setSelectedAppId(null);
+        setDetailData(null);
+        setDetailError(null);
+      }
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [openAppDetail]);
 
   const handleSelectTab = (tab: NavTab) => {
     setActiveTab(tab);
+    if (tab !== 'upload') {
+      setEditingApp(null);
+    }
     setSelectedAppId(null);
     setDetailData(null);
+    setDetailError(null);
+    if (new URLSearchParams(window.location.search).has('app')) {
+      syncAppQueryUrl(null);
+    }
     window.scrollTo({ top: 0, behavior: 'smooth' });
   };
 
@@ -321,24 +435,60 @@ export default function App() {
 
   const handleQuickInstall = async (app: StoreApp) => {
     setQuickInstallingId(app.id);
+    setQuickInstallError(null);
+
     let backendOnline = false;
+    let verified = false;
+
     try {
-      const res = await fetch(`./api/apps/${encodeURIComponent(app.id)}/install`, {
-        method: 'POST',
-      });
-      const contentType = res.headers.get('content-type') || '';
-      if (res.ok && contentType.includes('application/json')) {
+      const vRes = await fetch(`./api/apps/${encodeURIComponent(app.id)}/verify-apk`);
+      const vCt = vRes.headers.get('content-type') || '';
+      if (vCt.includes('application/json')) {
         backendOnline = true;
-        const data = (await res.json()) as { downloads: number };
-        setApps((prev) =>
-          prev.map((a) => (a.id === app.id ? { ...a, downloads: data.downloads } : a))
-        );
+        const vData = (await vRes.json()) as { valid?: boolean };
+        if (!vRes.ok || !vData.valid) {
+          setQuickInstallingId(null);
+          setQuickInstallError(`تعذر تثبيت «${app.name}»: ملف APK تالف أو غير مكتمل.`);
+          return;
+        }
+        verified = true;
       }
     } catch {
       backendOnline = false;
     }
 
+    if (!backendOnline) {
+      const localCheck = await localVerifyApkBlob(app);
+      if (!localCheck.valid) {
+        setQuickInstallingId(null);
+        setQuickInstallError(`تعذر تثبيت «${app.name}»: ملف APK تالف أو غير مكتمل.`);
+        return;
+      }
+      verified = true;
+    }
+
+    if (!verified) {
+      setQuickInstallingId(null);
+      setQuickInstallError('تعذر التحقق من سلامة ملف APK قبل التثبيت.');
+      return;
+    }
+
     if (backendOnline) {
+      try {
+        const res = await fetch(`./api/apps/${encodeURIComponent(app.id)}/install`, {
+          method: 'POST',
+        });
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
+          const data = (await res.json()) as { downloads: number };
+          setApps((prev) =>
+            prev.map((a) => (a.id === app.id ? { ...a, downloads: data.downloads } : a))
+          );
+        }
+      } catch {
+        // Ignore non-critical counter failure
+      }
+
       const link = document.createElement('a');
       link.href = `./api/apps/${encodeURIComponent(app.id)}/install-apk`;
       link.setAttribute('download', `${app.packageName}-v${app.versionName}.apk`);
@@ -384,12 +534,38 @@ export default function App() {
     setApps((prev) => prev.filter((a) => a.id !== appId));
     setSelectedAppId(null);
     setDetailData(null);
+    setDetailError(null);
+    syncAppQueryUrl(null);
   };
 
-  const handlePublished = (newApp: StoreApp) => {
-    setApps((prev) => [newApp, ...prev]);
+  const handleStartEdit = (app: StoreApp) => {
+    setEditingApp(app);
+    setSelectedAppId(null);
+    setDetailData(null);
+    setDetailError(null);
+    if (new URLSearchParams(window.location.search).has('app')) {
+      syncAppQueryUrl(null);
+    }
+    setActiveTab('upload');
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  };
+
+  const handleAppSaved = (savedApp: StoreApp, isUpdate: boolean) => {
+    if (isUpdate) {
+      setApps((prev) => prev.map((a) => (a.id === savedApp.id ? savedApp : a)));
+      setDetailData((prev) =>
+        prev && prev.app.id === savedApp.id ? { ...prev, app: savedApp } : prev
+      );
+      setEditingApp(null);
+    } else {
+      setApps((prev) => [savedApp, ...prev.filter((a) => a.id !== savedApp.id)]);
+    }
+  };
+
+  const handleOpenAppFromStudio = (appId: string) => {
     setActiveTab('apps');
-    void openAppDetail(newApp.id);
+    setEditingApp(null);
+    void openAppDetail(appId);
   };
 
   const showHero =
@@ -407,6 +583,8 @@ export default function App() {
         {activeTab === 'upload' ? (
           <UploadStudioView
             user={currentUser}
+            apps={apps}
+            editingApp={editingApp}
             authLoading={authLoading}
             authError={authError}
             onManualAuth={handleManualAuth}
@@ -414,10 +592,24 @@ export default function App() {
             onSignOut={handleSignOut}
             getAuthToken={getAuthToken}
             onBack={() => handleSelectTab('apps')}
-            onPublished={handlePublished}
+            onOpenApp={handleOpenAppFromStudio}
+            onStartEdit={handleStartEdit}
+            onCancelEdit={() => setEditingApp(null)}
+            onAppSaved={handleAppSaved}
           />
         ) : selectedAppId ? (
-          loadingDetail || !detailData ? (
+          detailError ? (
+            <div className="max-w-xl mx-auto px-4 sm:px-6 lg:px-8 py-20 text-center space-y-4">
+              <p className="text-base font-bold text-[#202124]">{detailError}</p>
+              <button
+                type="button"
+                onClick={() => handleSelectTab('apps')}
+                className="px-5 py-2.5 text-xs font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] rounded-xl transition-colors"
+              >
+                العودة إلى المتجر
+              </button>
+            </div>
+          ) : loadingDetail || !detailData ? (
             <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-20 text-center space-y-3">
               <div className="w-8 h-8 mx-auto border-2 border-[#01875F]/30 border-t-[#01875F] rounded-full animate-spin" />
               <p className="text-sm text-[#5F6368]">جاري تحميل صفحة التطبيق والمراجعات...</p>
@@ -431,7 +623,10 @@ export default function App() {
               onBack={() => {
                 setSelectedAppId(null);
                 setDetailData(null);
+                setDetailError(null);
+                syncAppQueryUrl(null);
               }}
+              onEditApp={handleStartEdit}
               onAppUpdated={handleAppUpdated}
               onAppDeleted={handleAppDeleted}
             />
@@ -559,14 +754,17 @@ export default function App() {
                     <div className="flex flex-wrap items-center gap-3">
                       <button
                         type="button"
-                        onClick={() => handleQuickInstall(featuredApp)}
-                        className="inline-flex items-center gap-2 px-6 py-3 text-sm font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] rounded-xl transition-colors whitespace-nowrap"
+                        onClick={() => void handleQuickInstall(featuredApp)}
+                        disabled={quickInstallingId === featuredApp.id}
+                        className="inline-flex items-center gap-2 px-6 py-3 text-sm font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] disabled:opacity-75 rounded-xl transition-colors whitespace-nowrap"
                       >
                         <Download className="w-4 h-4" />
                         <span>
-                          {quickInstalledId === featuredApp.id
-                            ? 'تم إرسال الحزمة للتثبيت'
-                            : 'تثبيت مباشر'}
+                          {quickInstallingId === featuredApp.id
+                            ? 'جاري تجهيز APK...'
+                            : quickInstalledId === featuredApp.id
+                            ? 'تم تجهيز الحزمة لنظام Android'
+                            : 'تثبيت التطبيق'}
                         </span>
                       </button>
 
@@ -591,6 +789,20 @@ export default function App() {
                   />
                 </div>
               </section>
+            )}
+
+            {/* Quick Install Validation Error */}
+            {quickInstallError && (
+              <div className="p-4 bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl flex items-center justify-between gap-3">
+                <span>{quickInstallError}</span>
+                <button
+                  type="button"
+                  onClick={() => setQuickInstallError(null)}
+                  className="font-semibold underline shrink-0"
+                >
+                  إغلاق
+                </button>
+              </div>
             )}
 
             {/* Catalog Section */}
@@ -729,14 +941,14 @@ export default function App() {
                             {isInstalled ? (
                               <>
                                 <CheckCircle2 className="w-3.5 h-3.5" />
-                                <span>تم الإرسال</span>
+                                <span>تم تجهيز الحزمة</span>
                               </>
                             ) : isInstalling ? (
-                              <span>جاري التثبيت...</span>
+                              <span>جاري التجهيز...</span>
                             ) : (
                               <>
                                 <Download className="w-3.5 h-3.5" />
-                                <span>تثبيت</span>
+                                <span>تثبيت التطبيق</span>
                               </>
                             )}
                           </button>
@@ -753,7 +965,7 @@ export default function App() {
 
       <footer className="border-t border-[#E8EAED] bg-[#F8F9FA] mt-12">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-[#5F6368]">
-          <span>متجر تطبيقات بلس — منصة تثبيت ومراجعة تطبيقات أندرويد</span>
+          <span>Play55 | متجر تطبيقات بلس — منصة تثبيت ومراجعة تطبيقات أندرويد</span>
           <div className="flex items-center gap-5">
             <button
               type="button"

@@ -1,10 +1,15 @@
 import { useEffect, useRef, useState } from 'react';
 import type { DragEvent, FormEvent } from 'react';
 import {
+  AlertTriangle,
   ArrowRight,
   CheckCircle2,
+  Copy,
+  Edit3,
+  ExternalLink,
   FileArchive,
   ImagePlus,
+  Link2,
   Lock,
   LogOut,
   Mail,
@@ -22,14 +27,19 @@ import type {
   ExtractedApkInfo,
   StoreApp,
 } from '../types.ts';
+import { resolveAssetUrl } from '../catalog/fallbackStore.ts';
 import { parseApkFile } from '../utils/apkParser.ts';
 import {
   buildSampleApkFileClient,
   localPublishApp,
+  localUpdateApp,
 } from '../utils/localStoreEngine.ts';
+import { AppIcon } from './AppIcon.tsx';
 
 interface UploadStudioViewProps {
   user: DeveloperSessionUser | null;
+  apps: StoreApp[];
+  editingApp: StoreApp | null;
   authLoading: boolean;
   authError: string | null;
   onManualAuth: (params: {
@@ -42,7 +52,10 @@ interface UploadStudioViewProps {
   onSignOut: () => Promise<void>;
   getAuthToken: () => Promise<string | null>;
   onBack: () => void;
-  onPublished: (newApp: StoreApp) => void;
+  onOpenApp: (appId: string) => void;
+  onStartEdit: (app: StoreApp) => void;
+  onCancelEdit: () => void;
+  onAppSaved: (savedApp: StoreApp, isUpdate: boolean) => void;
 }
 
 const CATEGORIES: AppCategory[] = [
@@ -63,6 +76,8 @@ interface PromoPreview {
 
 export function UploadStudioView({
   user,
+  apps,
+  editingApp,
   authLoading,
   authError,
   onManualAuth,
@@ -70,7 +85,10 @@ export function UploadStudioView({
   onSignOut,
   getAuthToken,
   onBack,
-  onPublished,
+  onOpenApp,
+  onStartEdit,
+  onCancelEdit,
+  onAppSaved,
 }: UploadStudioViewProps) {
   const apkInputRef = useRef<HTMLInputElement>(null);
   const customIconInputRef = useRef<HTMLInputElement>(null);
@@ -101,12 +119,6 @@ export function UploadStudioView({
   const [fullDescription, setFullDescription] = useState('');
   const [whatsNew, setWhatsNew] = useState('');
   const [packageName, setPackageName] = useState('');
-
-  useEffect(() => {
-    if (user?.displayName && !developer.trim()) {
-      setDeveloper(user.displayName);
-    }
-  }, [user, developer]);
   const [versionName, setVersionName] = useState('');
   const [versionCode, setVersionCode] = useState('');
   const [minAndroid, setMinAndroid] = useState('Android 8.0+');
@@ -115,14 +127,94 @@ export function UploadStudioView({
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [lastSavedBanner, setLastSavedBanner] = useState<{
+    app: StoreApp;
+    isUpdate: boolean;
+  } | null>(null);
+  const [copiedAppId, setCopiedAppId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (user?.displayName && !developer.trim() && !editingApp) {
+      setDeveloper(user.displayName);
+    }
+  }, [user, developer, editingApp]);
+
+  useEffect(() => {
+    if (editingApp) {
+      setError(null);
+      setApkFile(null);
+      setExtracted(null);
+      setCustomIconFile(null);
+      setCustomIconPreview((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return null;
+      });
+      setScreenshots([]);
+      setName(editingApp.name);
+      setDeveloper(editingApp.developer);
+      setCategory(editingApp.category);
+      setShortDescription(editingApp.shortDescription);
+      setFullDescription(editingApp.fullDescription);
+      setWhatsNew(editingApp.whatsNew);
+      setPackageName(editingApp.packageName);
+      setVersionName(editingApp.versionName);
+      setVersionCode(editingApp.versionCode);
+      setMinAndroid(editingApp.minAndroid);
+      setAgeRating(editingApp.ageRating);
+    }
+  }, [editingApp]);
+
+  const buildPermanentLink = (appId: string) =>
+    `${window.location.origin}${window.location.pathname}?app=${encodeURIComponent(appId)}`;
+
+  const handleCopyAppLink = async (appId: string) => {
+    try {
+      await navigator.clipboard.writeText(buildPermanentLink(appId));
+      setCopiedAppId(appId);
+      window.setTimeout(() => {
+        setCopiedAppId((prev) => (prev === appId ? null : prev));
+      }, 2500);
+    } catch {
+      setCopiedAppId(null);
+    }
+  };
+
+  const resetFormFields = () => {
+    setApkFile(null);
+    setExtracted(null);
+    setCustomIconFile(null);
+    if (customIconPreview) URL.revokeObjectURL(customIconPreview);
+    setCustomIconPreview(null);
+    setScreenshots([]);
+    setName('');
+    setDeveloper(user?.displayName || '');
+    setCategory('الإنتاجية');
+    setShortDescription('');
+    setFullDescription('');
+    setWhatsNew('');
+    setPackageName('');
+    setVersionName('');
+    setVersionCode('');
+    setMinAndroid('Android 8.0+');
+    setAgeRating('+3');
+  };
 
   const processApkFile = async (file: File) => {
     setError(null);
-    setApkFile(file);
     setParsingApk(true);
 
     try {
       const info = await parseApkFile(file);
+      if (!info.isValidZipApk) {
+        setApkFile(null);
+        setExtracted(null);
+        setError(
+          info.validationError ||
+            'الملف المحدد ليس حزمة APK صالحة، يرجى اختيار ملف Android APK سليم.'
+        );
+        return;
+      }
+      setApkFile(file);
       setExtracted(info);
       setPackageName(info.packageName);
       setVersionName(info.versionName);
@@ -137,6 +229,8 @@ export function UploadStudioView({
         setCustomIconFile(null);
       }
     } catch {
+      setApkFile(null);
+      setExtracted(null);
       setError('تعذر قراءة ملف APK. تأكد من أن الملف صالح بصيغة أندرويد.');
     } finally {
       setParsingApk(false);
@@ -230,8 +324,14 @@ export function UploadStudioView({
       return;
     }
 
-    if (!apkFile) {
+    const isUpdate = Boolean(editingApp);
+
+    if (!isUpdate && !apkFile) {
       setError('يرجى رفع ملف التطبيق بصيغة APK أولاً.');
+      return;
+    }
+    if (apkFile && extracted && !extracted.isValidZipApk) {
+      setError(extracted.validationError || 'ملف APK المرفوع غير صالح.');
       return;
     }
     if (!name.trim()) {
@@ -249,13 +349,11 @@ export function UploadStudioView({
     } catch {
       idToken = null;
     }
-    if (!idToken) {
-      setError('انتهت صلاحية الجلسة، يرجى إعادة تسجيل الدخول.');
-      return;
-    }
 
     const formData = new FormData();
-    formData.append('apk', apkFile);
+    if (apkFile) {
+      formData.append('apk', apkFile);
+    }
 
     if (customIconFile) {
       formData.append('icon', customIconFile);
@@ -273,52 +371,106 @@ export function UploadStudioView({
     formData.append('shortDescription', shortDescription.trim());
     formData.append('fullDescription', fullDescription.trim() || shortDescription.trim());
     formData.append('whatsNew', whatsNew.trim());
-    formData.append('packageName', packageName.trim() || extracted?.packageName || 'com.app.android');
-    formData.append('versionName', versionName.trim() || extracted?.versionName || '1.0.0');
-    formData.append('versionCode', versionCode.trim() || extracted?.versionCode || '1');
-    formData.append('minAndroid', minAndroid.trim() || 'Android 8.0+');
+    formData.append(
+      'packageName',
+      packageName.trim() || extracted?.packageName || editingApp?.packageName || 'com.app.android'
+    );
+    formData.append(
+      'versionName',
+      versionName.trim() || extracted?.versionName || editingApp?.versionName || '1.0.0'
+    );
+    formData.append(
+      'versionCode',
+      versionCode.trim() || extracted?.versionCode || editingApp?.versionCode || '1'
+    );
+    formData.append('minAndroid', minAndroid.trim() || editingApp?.minAndroid || 'Android 8.0+');
     formData.append('ageRating', ageRating);
-    formData.append('sizeMB', String(extracted?.sizeMB || 1));
-    formData.append('permissionsCount', String(extracted?.permissionsCount || 0));
+    if (extracted) {
+      formData.append('sizeMB', String(extracted.sizeMB || 1));
+      formData.append('permissionsCount', String(extracted.permissionsCount || 0));
+    }
 
     setUploading(true);
     setUploadProgress(0);
 
-    const publishLocally = async () => {
+    const finalizeSave = (savedApp: StoreApp) => {
+      setUploadProgress(100);
+      setUploading(false);
+      setLastSavedBanner({ app: savedApp, isUpdate });
+      resetFormFields();
+      onAppSaved(savedApp, isUpdate);
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    };
+
+    const saveLocally = async () => {
       try {
         setUploadProgress(60);
         const iconBlob = customIconFile || extracted?.iconBlob || null;
-        const newApp = await localPublishApp({
-          apkFile,
-          iconSource: iconBlob,
-          screenshots: screenshots.map((s) => s.file),
-          name: name.trim(),
-          developer: developer.trim() || user.displayName || 'مطور مستقل',
-          category,
-          shortDescription: shortDescription.trim(),
-          fullDescription: fullDescription.trim() || shortDescription.trim(),
-          whatsNew: whatsNew.trim(),
-          packageName: packageName.trim() || extracted?.packageName || 'com.app.android',
-          versionName: versionName.trim() || extracted?.versionName || '1.0.0',
-          versionCode: versionCode.trim() || extracted?.versionCode || '1',
-          minAndroid: minAndroid.trim() || 'Android 8.0+',
-          ageRating,
-          sizeMB: extracted?.sizeMB || 1,
-          permissionsCount: extracted?.permissionsCount || 0,
-          owner: user,
-        });
-        setUploadProgress(100);
+        const savedApp = editingApp
+          ? await localUpdateApp({
+              existingApp: editingApp,
+              apkFile,
+              iconSource: iconBlob,
+              screenshots: screenshots.map((s) => s.file),
+              name: name.trim(),
+              developer: developer.trim() || user.displayName || 'مطور مستقل',
+              category,
+              shortDescription: shortDescription.trim(),
+              fullDescription: fullDescription.trim() || shortDescription.trim(),
+              whatsNew: whatsNew.trim(),
+              packageName: packageName.trim() || extracted?.packageName || editingApp.packageName,
+              versionName: versionName.trim() || extracted?.versionName || editingApp.versionName,
+              versionCode: versionCode.trim() || extracted?.versionCode || editingApp.versionCode,
+              minAndroid: minAndroid.trim() || editingApp.minAndroid,
+              ageRating,
+              sizeMB: extracted?.sizeMB,
+              isBinaryManifest: extracted?.isBinaryManifest,
+              isSignedApk: extracted?.isSignedApk,
+              permissionsCount: extracted?.permissionsCount,
+              owner: user,
+            })
+          : await localPublishApp({
+              apkFile: apkFile!,
+              iconSource: iconBlob,
+              screenshots: screenshots.map((s) => s.file),
+              name: name.trim(),
+              developer: developer.trim() || user.displayName || 'مطور مستقل',
+              category,
+              shortDescription: shortDescription.trim(),
+              fullDescription: fullDescription.trim() || shortDescription.trim(),
+              whatsNew: whatsNew.trim(),
+              packageName: packageName.trim() || extracted?.packageName || 'com.app.android',
+              versionName: versionName.trim() || extracted?.versionName || '1.0.0',
+              versionCode: versionCode.trim() || extracted?.versionCode || '1',
+              minAndroid: minAndroid.trim() || 'Android 8.0+',
+              ageRating,
+              sizeMB: extracted?.sizeMB || 1,
+              isBinaryManifest: extracted?.isBinaryManifest,
+              isSignedApk: extracted?.isSignedApk,
+              permissionsCount: extracted?.permissionsCount || 0,
+              owner: user,
+            });
+        finalizeSave(savedApp);
+      } catch (localErr) {
         setUploading(false);
-        onPublished(newApp);
-      } catch {
-        setUploading(false);
-        setError('حدث خطأ أثناء حفظ ملف APK محلياً في المتصفح.');
+        setError(
+          localErr instanceof Error
+            ? localErr.message
+            : 'حدث خطأ أثناء حفظ بيانات التطبيق محلياً.'
+        );
       }
     };
 
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', './api/apps');
-    xhr.setRequestHeader('Authorization', `Bearer ${idToken}`);
+    xhr.open(
+      editingApp ? 'PUT' : 'POST',
+      editingApp ? `./api/apps/${encodeURIComponent(editingApp.id)}` : './api/apps'
+    );
+    xhr.withCredentials = true;
+    xhr.setRequestHeader('X-Requested-With', 'Play55');
+    if (idToken) {
+      xhr.setRequestHeader('Authorization', `Bearer ${idToken}`);
+    }
 
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) {
@@ -329,20 +481,24 @@ export function UploadStudioView({
     xhr.onload = () => {
       const contentType = xhr.getResponseHeader('content-type') || '';
       if (xhr.status >= 200 && xhr.status < 300 && contentType.includes('application/json')) {
-        setUploading(false);
         try {
           const parsed = JSON.parse(xhr.responseText) as { app: StoreApp };
-          onPublished(parsed.app);
+          finalizeSave(parsed.app);
         } catch {
+          setUploading(false);
           setError('تم الرفع ولكن تعذر قراءة استجابة الخادم.');
         }
-      } else if (xhr.status === 404 || xhr.status === 405 || !contentType.includes('application/json')) {
-        void publishLocally();
+      } else if (
+        (!editingApp && xhr.status === 404) ||
+        xhr.status === 405 ||
+        !contentType.includes('application/json')
+      ) {
+        void saveLocally();
       } else {
         setUploading(false);
         try {
           const parsed = JSON.parse(xhr.responseText) as { error?: string };
-          setError(parsed.error || 'فشل رفع التطبيق، تأكد من حجم الملفات وحاول مجدداً.');
+          setError(parsed.error || 'فشل حفظ التطبيق، تأكد من حجم الملفات وحاول مجدداً.');
         } catch {
           setError('حدث خطأ غير متوقع أثناء نشر التطبيق.');
         }
@@ -350,13 +506,16 @@ export function UploadStudioView({
     };
 
     xhr.onerror = () => {
-      void publishLocally();
+      void saveLocally();
     };
 
     xhr.send(formData);
   };
 
-  const activeIconPreview = customIconPreview || extracted?.iconDataUrl || null;
+  const activeIconPreview =
+    customIconPreview ||
+    extracted?.iconDataUrl ||
+    (editingApp ? resolveAssetUrl(editingApp.iconUrl) : null);
 
   if (authLoading) {
     return (
@@ -552,6 +711,8 @@ export function UploadStudioView({
     );
   }
 
+  const myApps = apps.filter((a) => a.ownerUid === user.uid);
+
   return (
     <div className="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
       {/* Authenticated Developer Identity Bar */}
@@ -589,6 +750,145 @@ export function UploadStudioView({
         </button>
       </div>
 
+      {/* Post-Publish / Post-Update Permanent App Link Banner */}
+      {lastSavedBanner && (
+        <section className="p-5 bg-[#E6F4EA] border border-[#01875F]/30 rounded-2xl space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 text-sm font-bold text-[#016E4D]">
+              <CheckCircle2 className="w-5 h-5 shrink-0" />
+              <span>
+                {lastSavedBanner.isUpdate
+                  ? `تم تحديث تطبيق «${lastSavedBanner.app.name}» إلى الإصدار v${lastSavedBanner.app.versionName} مع الحفاظ على نفس الرابط الدائم!`
+                  : `تم نشر تطبيق «${lastSavedBanner.app.name}» وإنشاء رابطه الخاص تلقائياً!`}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setLastSavedBanner(null)}
+              aria-label="إغلاق الإشعار"
+              className="text-[#016E4D] hover:opacity-75 p-1"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3 bg-white border border-[#01875F]/20 rounded-xl">
+            <div className="flex items-center gap-2 min-w-0">
+              <Link2 className="w-4 h-4 text-[#01875F] shrink-0" />
+              <code className="text-xs font-mono text-[#202124] truncate" dir="ltr">
+                {buildPermanentLink(lastSavedBanner.app.id)}
+              </code>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => void handleCopyAppLink(lastSavedBanner.app.id)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#01875F] bg-[#E6F4EA] hover:bg-[#D5ECD9] rounded-lg transition-colors"
+              >
+                <Copy className="w-3.5 h-3.5" />
+                <span>{copiedAppId === lastSavedBanner.app.id ? 'تم نسخ الرابط' : 'نسخ الرابط'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onOpenApp(lastSavedBanner.app.id)}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] rounded-lg transition-colors"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                <span>فتح صفحة التطبيق</span>
+              </button>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {/* Developer Dashboard: My Published Apps & Independent Permanent Links */}
+      <section className="p-5 bg-white border border-[#E8EAED] rounded-2xl space-y-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="font-display text-lg font-bold text-[#202124]">
+              لوحة تحكم المطور — تطبيقاتي وروابطها الخاصة
+            </h2>
+            <p className="text-xs text-[#5F6368]">
+              لكل تطبيق رابط دائم لا يتغير عند تحديث الإصدار؛ شاركه ليفتح الزوار صفحة تطبيقك مباشرة.
+            </p>
+          </div>
+          <span className="text-xs font-semibold text-[#01875F] bg-[#E6F4EA] px-3 py-1 rounded-lg tabular-nums">
+            {myApps.length} تطبيق منشور
+          </span>
+        </div>
+
+        {myApps.length === 0 ? (
+          <p className="text-xs text-[#5F6368] py-4 text-center bg-[#F8F9FA] rounded-xl">
+            لم تنشر أي تطبيقات بعد. ارفع ملف APK في النموذج أدناه ليظهر رابطه الخاص هنا تلقائياً.
+          </p>
+        ) : (
+          <div className="divide-y divide-[#E8EAED]">
+            {myApps.map((item) => {
+              const appLink = buildPermanentLink(item.id);
+              const isEditingThis = editingApp?.id === item.id;
+              return (
+                <div
+                  key={item.id}
+                  className={`py-4 first:pt-2 last:pb-1 flex flex-col lg:flex-row lg:items-center justify-between gap-4 ${
+                    isEditingThis ? 'bg-[#E6F4EA]/35 -mx-3 px-3 rounded-xl' : ''
+                  }`}
+                >
+                  <div className="flex items-start gap-3 min-w-0">
+                    <AppIcon src={item.iconUrl} alt={item.name} className="w-12 h-12 rounded-xl shrink-0" />
+                    <div className="min-w-0 space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-display text-sm font-bold text-[#202124] truncate">
+                          {item.name}
+                        </span>
+                        <span className="text-[11px] font-mono bg-[#F1F3F4] text-[#202124] px-2 py-0.5 rounded-md" dir="ltr">
+                          v{item.versionName}
+                        </span>
+                        <span className="text-[11px] text-[#5F6368] tabular-nums">
+                          {item.downloads} تثبيت
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5 text-xs text-[#5F6368] min-w-0">
+                        <Link2 className="w-3.5 h-3.5 text-[#01875F] shrink-0" />
+                        <code className="font-mono text-[11px] truncate" dir="ltr">
+                          {appLink}
+                        </code>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => void handleCopyAppLink(item.id)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-[#202124] bg-[#F8F9FA] hover:bg-[#F1F3F4] border border-[#DADCE0] rounded-lg transition-colors"
+                    >
+                      <Copy className="w-3.5 h-3.5 text-[#01875F]" />
+                      <span>{copiedAppId === item.id ? 'تم النسخ' : 'نسخ الرابط'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onOpenApp(item.id)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-[#202124] bg-[#F8F9FA] hover:bg-[#F1F3F4] border border-[#DADCE0] rounded-lg transition-colors"
+                    >
+                      <ExternalLink className="w-3.5 h-3.5 text-[#5F6368]" />
+                      <span>عرض الصفحة</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => onStartEdit(item)}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] rounded-lg transition-colors"
+                    >
+                      <Edit3 className="w-3.5 h-3.5" />
+                      <span>{isEditingThis ? 'جاري التحديث...' : 'تحديث الإصدار'}</span>
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </section>
+
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-6 border-b border-[#E8EAED]">
         <div className="space-y-1">
           <button
@@ -600,22 +900,42 @@ export function UploadStudioView({
             <span>العودة إلى المتجر</span>
           </button>
           <h1 className="font-display text-2xl sm:text-3xl font-bold text-[#202124]">
-            استوديو نشر التطبيقات (APK)
+            {editingApp
+              ? `تحديث تطبيق «${editingApp.name}»`
+              : 'استوديو نشر التطبيقات (APK)'}
           </h1>
           <p className="text-sm text-[#5F6368]">
-            ارفع ملف APK لاستخراج الأيقونة وبيانات الحزمة تلقائياً، ثم أضف الصور الترويجية والوصف للنشر الفوري.
+            {editingApp
+              ? `سيتم تحديث التطبيق وتصدير الإصدار الجديد مع الاحتفاظ بنفس الرابط الدائم (${editingApp.id}). يمكنك رفع APK جديد أو تعديل البيانات فقط.`
+              : 'ارفع ملف APK لاستخراج الأيقونة وبيانات الحزمة تلقائياً، ثم أضف الصور الترويجية والوصف للنشر الفوري.'}
           </p>
         </div>
 
-        <button
-          type="button"
-          onClick={handleLoadSampleApk}
-          disabled={parsingApk || uploading}
-          className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-[#01875F] bg-[#01875F]/8 hover:bg-[#01875F]/15 rounded-xl transition-colors whitespace-nowrap shrink-0"
-        >
-          <Sparkles className="w-4 h-4" />
-          <span>تجربة بملف APK نموذجي</span>
-        </button>
+        <div className="flex items-center gap-2 shrink-0">
+          {editingApp ? (
+            <button
+              type="button"
+              onClick={() => {
+                onCancelEdit();
+                resetFormFields();
+              }}
+              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-[#5F6368] bg-[#F1F3F4] hover:bg-[#E8EAED] rounded-xl transition-colors whitespace-nowrap"
+            >
+              <X className="w-4 h-4" />
+              <span>إلغاء التحديث والانتقال لنشر جديد</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={handleLoadSampleApk}
+              disabled={parsingApk || uploading}
+              className="inline-flex items-center gap-2 px-4 py-2 text-xs font-semibold text-[#01875F] bg-[#01875F]/8 hover:bg-[#01875F]/15 rounded-xl transition-colors whitespace-nowrap"
+            >
+              <Sparkles className="w-4 h-4" />
+              <span>تجربة بملف APK نموذجي</span>
+            </button>
+          )}
+        </div>
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-8">
@@ -623,7 +943,9 @@ export function UploadStudioView({
         <section className="space-y-4">
           <div className="flex items-center justify-between">
             <h2 className="font-display text-lg font-bold text-[#202124]">
-              1. حزمة التطبيق (APK) واستخراج الأيقونة
+              {editingApp
+                ? '1. تحديث ملف APK (اختياري) أو تعديل الأيقونة'
+                : '1. حزمة التطبيق (APK) واستخراج الأيقونة'}
             </h2>
             {apkFile && (
               <button
@@ -661,21 +983,59 @@ export function UploadStudioView({
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') apkInputRef.current?.click();
               }}
-              className={`cursor-pointer border-2 border-dashed rounded-2xl p-10 text-center transition-colors ${
+              className={`cursor-pointer border-2 border-dashed rounded-2xl p-8 sm:p-10 text-center transition-colors ${
                 apkDragging
                   ? 'border-[#01875F] bg-[#01875F]/5'
                   : 'border-[#DADCE0] bg-[#F8F9FA] hover:border-[#01875F]/60'
               }`}
             >
-              <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-[#01875F]/10 text-[#01875F] flex items-center justify-center">
-                <FileArchive className="w-7 h-7" />
-              </div>
-              <p className="font-display text-base font-bold text-[#202124] mb-1">
-                اسحب ملف APK وأفلته هنا، أو اضغط للاختيار من جهازك
-              </p>
-              <p className="text-xs text-[#5F6368]">
-                يدعم استخراج أيقونة التطبيق، اسم الحزمة، رقم الإصدار، والحد الأدنى لنظام أندرويد تلقائياً (حتى 150 MB)
-              </p>
+              {editingApp ? (
+                <div className="flex flex-col items-center gap-3">
+                  <div className="relative">
+                    <img
+                      src={activeIconPreview || ''}
+                      alt={editingApp.name}
+                      className="w-16 h-16 rounded-2xl object-cover border border-black/10 bg-white"
+                    />
+                    <button
+                      type="button"
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        customIconInputRef.current?.click();
+                      }}
+                      title="تغيير الأيقونة"
+                      className="absolute -bottom-1.5 -left-1.5 p-1.5 bg-white border border-[#DADCE0] rounded-full text-[#202124] hover:text-[#01875F] shadow-xs"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    </button>
+                    <input
+                      ref={customIconInputRef}
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp"
+                      className="hidden"
+                      onChange={(e) => handleCustomIconSelect(e.target.files?.[0])}
+                    />
+                  </div>
+                  <p className="font-display text-sm font-bold text-[#202124]">
+                    الحزمة الحالية محفوظة (v{editingApp.versionName}) — اضغط لرفع ملف APK أحدث إذا رغبت
+                  </p>
+                  <p className="text-xs text-[#5F6368]">
+                    أو اكتفِ بتعديل رقم الإصدار والوصف بالأسفل وسيتم الحفاظ على الحزمة والأيقونة الحالية.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <div className="w-14 h-14 mx-auto mb-4 rounded-2xl bg-[#01875F]/10 text-[#01875F] flex items-center justify-center">
+                    <FileArchive className="w-7 h-7" />
+                  </div>
+                  <p className="font-display text-base font-bold text-[#202124] mb-1">
+                    اسحب ملف APK وأفلته هنا، أو اضغط للاختيار من جهازك
+                  </p>
+                  <p className="text-xs text-[#5F6368]">
+                    يتحقق النظام من سلامة الحزمة ويستخرج الأيقونة، اسم الحزمة، رقم الإصدار تلقائياً (حتى 150 MB)
+                  </p>
+                </>
+              )}
             </div>
           ) : (
             <div className="p-5 sm:p-6 bg-[#F8F9FA] border border-[#E8EAED] rounded-2xl space-y-5">
@@ -734,6 +1094,12 @@ export function UploadStudioView({
                           {extracted?.packageName} · v{extracted?.versionName} · {extracted?.sizeMB} MB ·{' '}
                           {extracted?.minAndroid}
                         </p>
+                        {extracted?.isValidZipApk && (
+                          <p className="text-[#01875F] font-medium">
+                            حزمة APK سليمة ومكتملة
+                            {extracted.isSignedApk ? ' · موقّعة رقمياً' : ''}
+                          </p>
+                        )}
                       </div>
                     )}
                   </div>
@@ -954,15 +1320,20 @@ export function UploadStudioView({
         </section>
 
         {error && (
-          <div className="p-4 bg-red-50 border border-red-200 text-red-700 text-sm rounded-xl">
-            {error}
+          <div className="p-4 bg-red-50 border border-red-200 text-red-700 text-sm rounded-xl flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+            <span>{error}</span>
           </div>
         )}
 
         {uploading && (
           <div className="p-4 bg-[#F8F9FA] border border-[#E8EAED] rounded-xl space-y-2">
             <div className="flex items-center justify-between text-xs font-semibold text-[#202124]">
-              <span>جاري رفع ملف APK والصور الترويجية إلى المتجر...</span>
+              <span>
+                {editingApp
+                  ? 'جاري حفظ التحديث وتجهيز الإصدار الجديد بنفس الرابط...'
+                  : 'جاري رفع ملف APK والصور الترويجية إلى المتجر...'}
+              </span>
               <span className="tabular-nums">{uploadProgress}%</span>
             </div>
             <div className="w-full h-2 bg-[#E8EAED] rounded-full overflow-hidden">
@@ -977,7 +1348,14 @@ export function UploadStudioView({
         <div className="flex items-center justify-end gap-3 pt-4 border-t border-[#E8EAED]">
           <button
             type="button"
-            onClick={onBack}
+            onClick={() => {
+              if (editingApp) {
+                onCancelEdit();
+                resetFormFields();
+              } else {
+                onBack();
+              }
+            }}
             disabled={uploading}
             className="px-5 py-2.5 text-sm font-medium text-[#5F6368] hover:text-[#202124] rounded-xl transition-colors"
           >
@@ -989,7 +1367,15 @@ export function UploadStudioView({
             className="inline-flex items-center gap-2 px-7 py-3 text-sm font-semibold text-white bg-[#01875F] hover:bg-[#016E4D] disabled:opacity-60 rounded-xl transition-colors shadow-xs"
           >
             <Upload className="w-4 h-4" />
-            <span>{uploading ? 'جاري النشر...' : 'نشر التطبيق في المتجر'}</span>
+            <span>
+              {uploading
+                ? editingApp
+                  ? 'جاري حفظ التحديث...'
+                  : 'جاري النشر...'
+                : editingApp
+                ? 'حفظ التحديث بنفس الرابط'
+                : 'نشر التطبيق في المتجر'}
+            </span>
           </button>
         </div>
       </form>

@@ -35,6 +35,8 @@ export interface StoreApp {
   screenshots: string[];
   apkFilename: string;
   hasCustomApk: boolean;
+  isBinaryManifest?: boolean;
+  isSignedApk?: boolean;
   permissionsCount: number;
   downloads: number;
   averageRating: number;
@@ -74,8 +76,13 @@ export interface ExtractedApkInfo {
   minAndroid: string;
   permissionsCount: number;
   sizeMB: number;
+  isValidZipApk: boolean;
+  isBinaryManifest: boolean;
+  isSignedApk: boolean;
+  validationError?: string;
   iconDataUrl: string | null;
   iconBlob: Blob | null;
   iconFilename: string | null;
   iconSourcePath: string | null;
 }
+

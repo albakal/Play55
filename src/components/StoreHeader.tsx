@@ -34,8 +34,10 @@ export function StoreHeader({ activeTab, onSelectTab }: StoreHeaderProps) {
               />
             </svg>
           </span>
-          <span className="font-display text-base sm:text-lg font-bold tracking-tight">
-            متجر تطبيقات بلس
+          <span className="font-display text-base sm:text-lg font-bold tracking-tight flex items-center gap-1.5">
+            <span className="text-[#01875F]">Play55</span>
+            <span className="hidden xs:inline text-[#DADCE0]" aria-hidden="true">|</span>
+            <span className="text-sm sm:text-base font-semibold text-[#202124]">متجر تطبيقات بلس</span>
           </span>
         </button>
 
