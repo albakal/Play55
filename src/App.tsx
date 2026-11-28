@@ -81,7 +81,9 @@ export default function App() {
   const [authError, setAuthError] = useState<string | null>(null);
 
   useEffect(() => {
+    const timer = window.setTimeout(() => setAuthLoading(false), 2500);
     const unsubscribe = onAuthStateChanged(auth, (fbUser) => {
+      window.clearTimeout(timer);
       if (fbUser) {
         setManualToken(null);
         setCurrentUser({
@@ -99,8 +101,40 @@ export default function App() {
       }
       setAuthLoading(false);
     });
-    return () => unsubscribe();
+    return () => {
+      window.clearTimeout(timer);
+      unsubscribe();
+    };
   }, []);
+
+  const runLocalManualAuth = async (params: {
+    mode: 'login' | 'register';
+    name?: string;
+    email: string;
+    password: string;
+  }) => {
+    try {
+      const localResult =
+        params.mode === 'register'
+          ? await localRegisterDeveloper({
+              name: params.name || '',
+              email: params.email,
+              password: params.password,
+            })
+          : await localLoginDeveloper({
+              email: params.email,
+              password: params.password,
+            });
+      setManualToken(localResult.token);
+      setCurrentUser(localResult.user);
+    } catch (localErr) {
+      setAuthError(
+        localErr instanceof Error
+          ? localErr.message
+          : 'تعذر إنشاء الحساب أو تسجيل الدخول، يرجى المحاولة مرة أخرى.'
+      );
+    }
+  };
 
   const handleManualAuth = async (params: {
     mode: 'login' | 'register';
@@ -123,20 +157,7 @@ export default function App() {
       });
       const contentType = res.headers.get('content-type') || '';
       if (!contentType.includes('application/json') || res.status === 405) {
-        // Static hosting fallback (e.g. GitHub Pages): use client-side Web Crypto + IndexedDB
-        const localResult =
-          params.mode === 'register'
-            ? await localRegisterDeveloper({
-                name: params.name || '',
-                email: params.email,
-                password: params.password,
-              })
-            : await localLoginDeveloper({
-                email: params.email,
-                password: params.password,
-              });
-        setManualToken(localResult.token);
-        setCurrentUser(localResult.user);
+        await runLocalManualAuth(params);
         return;
       }
       const data = (await res.json()) as {
@@ -150,32 +171,8 @@ export default function App() {
       }
       setManualToken(data.token);
       setCurrentUser(data.user);
-    } catch (err) {
-      if (err instanceof Error && err.message && !err.message.includes('Failed to fetch')) {
-        setAuthError(err.message);
-        return;
-      }
-      try {
-        const localResult =
-          params.mode === 'register'
-            ? await localRegisterDeveloper({
-                name: params.name || '',
-                email: params.email,
-                password: params.password,
-              })
-            : await localLoginDeveloper({
-                email: params.email,
-                password: params.password,
-              });
-        setManualToken(localResult.token);
-        setCurrentUser(localResult.user);
-      } catch (localErr) {
-        setAuthError(
-          localErr instanceof Error
-            ? localErr.message
-            : 'تعذر إنشاء الحساب أو تسجيل الدخول، يرجى المحاولة مرة أخرى.'
-        );
-      }
+    } catch {
+      await runLocalManualAuth(params);
     }
   };
 

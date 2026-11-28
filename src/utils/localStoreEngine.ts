@@ -30,36 +30,62 @@ interface ReviewHelpfulPatch {
   helpfulCount: number;
 }
 
-function openLocalDb(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = () => {
-      const db = req.result;
-      if (!db.objectStoreNames.contains('developers')) {
-        db.createObjectStore('developers', { keyPath: 'email' });
-      }
-      if (!db.objectStoreNames.contains('apps')) {
-        db.createObjectStore('apps', { keyPath: 'id' });
-      }
-      if (!db.objectStoreNames.contains('apkBlobs')) {
-        db.createObjectStore('apkBlobs', { keyPath: 'appId' });
-      }
-      if (!db.objectStoreNames.contains('reviews')) {
-        db.createObjectStore('reviews', { keyPath: 'id' });
-      }
-      if (!db.objectStoreNames.contains('appStats')) {
-        db.createObjectStore('appStats', { keyPath: 'appId' });
-      }
-      if (!db.objectStoreNames.contains('reviewHelpful')) {
-        db.createObjectStore('reviewHelpful', { keyPath: 'reviewId' });
-      }
-    };
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
-  });
+const memoryStores: Record<string, Map<string, unknown>> = {
+  developers: new Map(),
+  apps: new Map(),
+  apkBlobs: new Map(),
+  reviews: new Map(),
+  appStats: new Map(),
+  reviewHelpful: new Map(),
+};
+
+const STORE_KEYS: Record<string, string> = {
+  developers: 'email',
+  apps: 'id',
+  apkBlobs: 'appId',
+  reviews: 'id',
+  appStats: 'appId',
+  reviewHelpful: 'reviewId',
+};
+
+async function openLocalDb(): Promise<IDBDatabase | null> {
+  if (typeof indexedDB === 'undefined') return null;
+  try {
+    return await new Promise<IDBDatabase>((resolve, reject) => {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains('developers')) {
+          db.createObjectStore('developers', { keyPath: 'email' });
+        }
+        if (!db.objectStoreNames.contains('apps')) {
+          db.createObjectStore('apps', { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains('apkBlobs')) {
+          db.createObjectStore('apkBlobs', { keyPath: 'appId' });
+        }
+        if (!db.objectStoreNames.contains('reviews')) {
+          db.createObjectStore('reviews', { keyPath: 'id' });
+        }
+        if (!db.objectStoreNames.contains('appStats')) {
+          db.createObjectStore('appStats', { keyPath: 'appId' });
+        }
+        if (!db.objectStoreNames.contains('reviewHelpful')) {
+          db.createObjectStore('reviewHelpful', { keyPath: 'reviewId' });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
+    });
+  } catch {
+    return null;
+  }
 }
 
-function idbGet<T>(db: IDBDatabase, storeName: string, key: string): Promise<T | undefined> {
+function idbGet<T>(db: IDBDatabase | null, storeName: string, key: string): Promise<T | undefined> {
+  if (!db) {
+    return Promise.resolve(memoryStores[storeName]?.get(key) as T | undefined);
+  }
   return new Promise((resolve, reject) => {
     const tx = db.transaction(storeName, 'readonly');
     const store = tx.objectStore(storeName);
@@ -69,7 +95,10 @@ function idbGet<T>(db: IDBDatabase, storeName: string, key: string): Promise<T |
   });
 }
 
-function idbGetAll<T>(db: IDBDatabase, storeName: string): Promise<T[]> {
+function idbGetAll<T>(db: IDBDatabase | null, storeName: string): Promise<T[]> {
+  if (!db) {
+    return Promise.resolve(Array.from((memoryStores[storeName] || new Map()).values()) as T[]);
+  }
   return new Promise((resolve, reject) => {
     const tx = db.transaction(storeName, 'readonly');
     const store = tx.objectStore(storeName);
@@ -79,7 +108,13 @@ function idbGetAll<T>(db: IDBDatabase, storeName: string): Promise<T[]> {
   });
 }
 
-function idbPut<T>(db: IDBDatabase, storeName: string, value: T): Promise<void> {
+function idbPut<T>(db: IDBDatabase | null, storeName: string, value: T): Promise<void> {
+  if (!db) {
+    const keyProp = STORE_KEYS[storeName] || 'id';
+    const keyVal = String((value as Record<string, unknown>)[keyProp] || '');
+    memoryStores[storeName]?.set(keyVal, value);
+    return Promise.resolve();
+  }
   return new Promise((resolve, reject) => {
     const tx = db.transaction(storeName, 'readwrite');
     const store = tx.objectStore(storeName);
@@ -89,7 +124,11 @@ function idbPut<T>(db: IDBDatabase, storeName: string, value: T): Promise<void> 
   });
 }
 
-function idbDelete(db: IDBDatabase, storeName: string, key: string): Promise<void> {
+function idbDelete(db: IDBDatabase | null, storeName: string, key: string): Promise<void> {
+  if (!db) {
+    memoryStores[storeName]?.delete(key);
+    return Promise.resolve();
+  }
   return new Promise((resolve, reject) => {
     const tx = db.transaction(storeName, 'readwrite');
     const store = tx.objectStore(storeName);
@@ -113,27 +152,54 @@ function hexToBytes(hex: string): Uint8Array {
   return out;
 }
 
+function getRandomBytes(length: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  if (typeof globalThis.crypto?.getRandomValues === 'function') {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < length; i++) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  return bytes;
+}
+
 async function derivePasswordHashHex(password: string, salt: Uint8Array): Promise<string> {
   const enc = new TextEncoder();
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw',
-    enc.encode(password),
-    'PBKDF2',
-    false,
-    ['deriveBits']
-  );
-  const saltBuffer = new Uint8Array(salt).buffer;
-  const bits = await crypto.subtle.deriveBits(
-    {
-      name: 'PBKDF2',
-      salt: saltBuffer,
-      iterations: 100_000,
-      hash: 'SHA-256',
-    },
-    keyMaterial,
-    256
-  );
-  return bytesToHex(new Uint8Array(bits));
+  if (typeof globalThis.crypto?.subtle?.importKey === 'function') {
+    const keyMaterial = await globalThis.crypto.subtle.importKey(
+      'raw',
+      enc.encode(password),
+      'PBKDF2',
+      false,
+      ['deriveBits']
+    );
+    const saltBuffer = new Uint8Array(salt).buffer;
+    const bits = await globalThis.crypto.subtle.deriveBits(
+      {
+        name: 'PBKDF2',
+        salt: saltBuffer,
+        iterations: 100_000,
+        hash: 'SHA-256',
+      },
+      keyMaterial,
+      256
+    );
+    return bytesToHex(new Uint8Array(bits));
+  }
+
+  // Fallback key-stretching mixer if Web Crypto SubtleCrypto is restricted
+  const input = new Uint8Array([...salt, ...enc.encode(password)]);
+  let state = 0x811c9dc5;
+  const out = new Uint8Array(32);
+  for (let round = 0; round < 512; round++) {
+    for (let i = 0; i < input.length; i++) {
+      state ^= input[i] ^ (round & 0xff);
+      state = Math.imul(state, 0x01000193) >>> 0;
+    }
+    out[round % 32] ^= state & 0xff;
+  }
+  return bytesToHex(out);
 }
 
 function constantTimeEqualHex(a: string, b: string): boolean {
@@ -146,7 +212,7 @@ function constantTimeEqualHex(a: string, b: string): boolean {
 }
 
 function randomId(prefix: string): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(6));
+  const bytes = getRandomBytes(6);
   return `${prefix}-${bytesToHex(bytes)}`;
 }
 
@@ -202,7 +268,7 @@ export async function localRegisterDeveloper(params: {
     throw new Error('هذا البريد الإلكتروني مسجل مسبقاً، يرجى تسجيل الدخول');
   }
 
-  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const salt = getRandomBytes(16);
   const hashHex = await derivePasswordHashHex(password, salt);
   const newUser: LocalStoredUser = {
     uid: randomId('local'),
